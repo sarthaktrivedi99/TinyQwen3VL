@@ -119,21 +119,22 @@ class NanoQwenVL(PreTrainedModel):
         if pixel_values is not None:
             # 1. Forward Vision Tower
             # MoonViT forward signature: (pixel_values, image_grid_hws)
-            # It usually returns a list of tensors (one per image) because lengths vary
+            # It returns a list of tensors (one per image) because lengths vary
+            # Each tensor has shape [num_tokens, num_sub_patches, vision_dim] e.g., [1092, 4, 1152]
             vision_outputs = self.vision_tower(pixel_values, image_grid_hws)
-            
-            # Note: Depending on MoonViT implementation, vision_outputs might be a list of tensors
-            # or a specific class. The model card says it returns a list of features.
             
             image_embeds_list = []
             
             # Process each image feature independently
-            # (Because native resolution means Image A has 200 tokens, Image B has 500)
             for i, vis_feat in enumerate(vision_outputs):
-                # vis_feat shape: [Num_Tokens, Vision_Dim] (No batch dim usually if it's a list)
+                # vis_feat shape: [Num_Tokens, 4, 1152]
+                # Flatten the sub-patch dimension: [Num_Tokens * 4, 1152]
+                if vis_feat.dim() == 3:
+                    num_tokens, num_sub, dim = vis_feat.shape
+                    vis_feat = vis_feat.reshape(num_tokens * num_sub, dim)
                 
-                # Project
-                proj_feat = self.projector(vis_feat) # [Num_Tokens, LLM_Dim]
+                # Project to LLM dimension
+                proj_feat = self.projector(vis_feat)  # [Num_Tokens * 4, LLM_Dim]
                 image_embeds_list.append(proj_feat)
 
             # 2. Merge into LLM sequence
@@ -222,7 +223,13 @@ class NanoQwenVL(PreTrainedModel):
             new_attention_mask = []
             
             for i in range(len(inputs_embeds)):
-                img_emb = self.projector(vision_outputs[i])
+                vis_feat = vision_outputs[i]
+                # Flatten 3D output: [Num_Tokens, 4, 1152] -> [Num_Tokens * 4, 1152]
+                if vis_feat.dim() == 3:
+                    num_tokens, num_sub, dim = vis_feat.shape
+                    vis_feat = vis_feat.reshape(num_tokens * num_sub, dim)
+                
+                img_emb = self.projector(vis_feat)
                 txt_emb = inputs_embeds[i]
                 
                 combined_emb = torch.cat([img_emb, txt_emb], dim=0)

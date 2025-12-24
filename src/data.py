@@ -70,8 +70,10 @@ class NanoVLMDataset(IterableDataset):
             # Process image with MoonViT processor
             # Returns pixel_values and image_grid_hws
             image_inputs = self.image_processor([image], return_tensors="pt")
-            pixel_values = image_inputs['pixel_values'].squeeze(0)  # Remove batch dim
-            image_grid_hws = image_inputs['image_grid_hws']  # List of (H, W) tuples
+            # Keep pixel_values with batch dim for proper batching later
+            pixel_values = image_inputs['pixel_values']  # [1, C, H, W] or similar
+            # image_grid_hws is a tensor of shape [N, 2] where N = num images
+            image_grid_hws = image_inputs['image_grid_hws']  # Tensor[N, 2]
 
             # --- B. Text Handling ---
             # FineVision uses 'texts' list of dicts: [{'user': '...', 'assistant': '...'}]
@@ -181,22 +183,31 @@ def collate_fn(batch):
     if len(batch) == 0:
         return {}
 
-    # Stack/concatenate pixel values
-    # MoonViT pixel_values may have variable shapes, so we concatenate along batch dim
-    pixel_values = torch.cat([item['pixel_values'].unsqueeze(0) if item['pixel_values'].dim() == 3 
-                              else item['pixel_values'] for item in batch], dim=0)
-    
-    # Collect image_grid_hws (list of tuples)
-    image_grid_hws = []
+    # Concatenate pixel values along batch dim
+    # Each item has pixel_values of shape [1, ...] or [C, H, W]
+    pixel_values_list = []
     for item in batch:
-        if isinstance(item['image_grid_hws'], torch.Tensor):
-            image_grid_hws.append(item['image_grid_hws'])
-        else:
-            image_grid_hws.extend(item['image_grid_hws'])
+        pv = item['pixel_values']
+        if pv.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+            pv = pv.unsqueeze(0)
+        pixel_values_list.append(pv)
+    pixel_values = torch.cat(pixel_values_list, dim=0)
     
-    # Stack if tensors
-    if image_grid_hws and isinstance(image_grid_hws[0], torch.Tensor):
-        image_grid_hws = torch.cat(image_grid_hws, dim=0)
+    # Concatenate image_grid_hws tensors
+    # Each item has image_grid_hws of shape [N, 2]
+    image_grid_hws_list = []
+    for item in batch:
+        hws = item['image_grid_hws']
+        if isinstance(hws, torch.Tensor):
+            image_grid_hws_list.append(hws)
+        elif isinstance(hws, list) and len(hws) > 0:
+            # Convert list of tuples to tensor
+            image_grid_hws_list.append(torch.tensor(hws))
+    
+    if image_grid_hws_list:
+        image_grid_hws = torch.cat(image_grid_hws_list, dim=0)
+    else:
+        image_grid_hws = None
     
     # Pad input_ids and labels
     # padding_value for input_ids is 0 (or tokenizer.pad_token_id)
