@@ -186,28 +186,34 @@ def collate_fn(batch):
     # Concatenate pixel values along batch dim
     # Each item has pixel_values of shape [1, ...] or [C, H, W]
     pixel_values_list = []
-    for item in batch:
+    print(f"\n[DEBUG Collate] Batch size: {len(batch)}")
+    for i, item in enumerate(batch):
         pv = item['pixel_values']
+        hws = item['image_grid_hws']
+        print(f"  Item {i} PV shape: {pv.shape}, HWs: {hws}")
+        
         if pv.dim() == 3:  # [C, H, W] -> [1, C, H, W]
             pv = pv.unsqueeze(0)
         pixel_values_list.append(pv)
     pixel_values = torch.cat(pixel_values_list, dim=0)
     
     # Concatenate image_grid_hws tensors
-    # Each item has image_grid_hws of shape [N, 2]
     image_grid_hws_list = []
     for item in batch:
         hws = item['image_grid_hws']
         if isinstance(hws, torch.Tensor):
             image_grid_hws_list.append(hws)
         elif isinstance(hws, list) and len(hws) > 0:
-            # Convert list of tuples to tensor
             image_grid_hws_list.append(torch.tensor(hws))
     
     if image_grid_hws_list:
         image_grid_hws = torch.cat(image_grid_hws_list, dim=0)
     else:
         image_grid_hws = None
+        
+    print(f"  Final PV shape: {pixel_values.shape}")
+    if image_grid_hws is not None:
+         print(f"  Final HWs shape: {image_grid_hws.shape}, Values: {image_grid_hws}")
     
     # Pad input_ids and labels
     # padding_value for input_ids is 0 (or tokenizer.pad_token_id)
