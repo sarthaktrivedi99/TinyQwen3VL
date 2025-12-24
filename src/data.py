@@ -33,117 +33,122 @@ class NanoVLMDataset(IterableDataset):
         if "<|image_pad|>" not in tokenizer.get_vocab():
             self.img_token_id = tokenizer.unk_token_id
             self.img_token_str = tokenizer.unk_token
+            print(f"[DEBUG] <|image_pad|> not found, using unk_token: {self.img_token_str} ({self.img_token_id})")
         else:
             self.img_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
-            self.img_token_str = "<|image_pad|>" 
+            self.img_token_str = "<|image_pad|>"
+            print(f"[DEBUG] Using <|image_pad|>: {self.img_token_str} ({self.img_token_id})") 
 
     def process_item(self, item):
         """
-        Processes a single raw item into a tensor dictionary.
-        Supports ShareGPT format:
+        Processes a single item from HuggingFaceM4/FineVision (CoSyn_400k_document).
+        Format:
         {
-            "image": "path/to/img" or url,
-            "conversations": [
-                {"from": "human", "value": "..."},
-                {"from": "gpt", "value": "..."}
-            ]
+            "images": [PIL.Image, ...],
+            "texts": ["Text content...", ...],
+            ...
         }
+        We treat this as a document parsing task:
+        User: <|image_pad|>
+        Assistant: <text>
         """
         try:
             # --- A. Image Handling ---
-            image = item.get('image') or (item.get('images')[0] if item.get('images') else None)
-            
-            # Skip corrupted/missing images
-            if image is None: 
+            # FineVision uses 'images' list
+            images = item.get('images')
+            if not images or len(images) == 0:
                 return None
-                
-            if isinstance(image, str):
-                try:
-                    image = Image.open(image).convert('RGB')
-                except:
-                    return None # Skip bad paths
+            
+            image = images[0]
+            
+            # Ensure PIL Image
+            if not isinstance(image, Image.Image):
+                if isinstance(image, str):
+                    try:
+                        image = Image.open(image).convert('RGB')
+                    except Exception as e:
+                        return None
+                else:
+                    return None
+            else:
+                image = image.convert('RGB')
             
             # Apply Vision Transform -> [3, 384, 384]
             pixel_values = self.transform(image) 
 
-            # --- B. Parse Conversations (ShareGPT) ---
-            # Fallback for pure text datasets or simple Q&A keys if strictly needed, 
-            # but we assume ShareGPT format as primary now.
-            conversations = item.get('conversations', [])
-            if not conversations:
-                # Minimal fallback if user didn't update data yet to avoid total crash
-                if 'question' in item and 'answer' in item:
-                    conversations = [
-                        {"from": "human", "value": item['question']},
-                        {"from": "gpt", "value": item['answer']}
-                    ]
-                else:
-                    return None
-
-            # --- C. Tokenization & Masking (Multi-turn) ---
-            image_placeholders = self.img_token_str * self.vision_config['num_tokens']
+            # --- B. Text Handling ---
+            # FineVision uses 'texts' list of dicts: [{'user': '...', 'assistant': '...'}]
+            texts = item.get('texts')
+            if not texts or len(texts) == 0:
+                return None
+                
+            # Construct conversation from all text turns
+            conversations = []
+            if isinstance(texts, list):
+                for t in texts:
+                    if isinstance(t, dict):
+                        if 'user' in t and 'assistant' in t:
+                            conversations.append({"from": "human", "value": t['user']})
+                            conversations.append({"from": "gpt", "value": t['assistant']})
             
-            input_ids = []
-            labels = []
+            if not conversations:
+                return None
+            
+            # --- C. Tokenization & Masking ---
+            image_placeholders = self.img_token_str * self.vision_config['num_tokens']
             
             # ChatML delimiters
             im_start = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
             im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-            nl = self.tokenizer.convert_tokens_to_ids("\n")
+            
+            # Tokenize newline (may be multiple tokens)
+            nl_ids = self.tokenizer("\n", add_special_tokens=False).input_ids
             
             # Pre-tokenized role headers
-            user_header = [im_start] + self.tokenizer("user", add_special_tokens=False).input_ids + [nl]
-            assistant_header = [im_start] + self.tokenizer("assistant", add_special_tokens=False).input_ids + [nl]
+            user_header = [im_start] + self.tokenizer("user", add_special_tokens=False).input_ids + nl_ids
+            assistant_header = [im_start] + self.tokenizer("assistant", add_special_tokens=False).input_ids + nl_ids
+            
+            input_ids = []
+            labels = []
             
             # Inject image into first user turn
             first_user_turn = True
             
-            for msg in conversations:
+            # Iterate through turns (user -> assistant -> user -> assistant)
+            # We assume the list is ordered: human, gpt, human, gpt...
+            for idx, msg in enumerate(conversations):
                 role = msg.get('from', '').lower()
                 content = msg.get('value', '').strip()
                 
-                # Check for image placeholder manually if needed, or auto-inject
-                # We auto-inject at start of first user message
                 if role in ['human', 'user']:
+                    # Inject image in first human turn
                     if first_user_turn:
                         content = f"{image_placeholders}\n{content}"
                         first_user_turn = False
                         
-                    # Tokenize content
                     content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
-                    
-                    # Full turn: Header + Content + End
-                    turn_ids = user_header + content_ids + [im_end, nl]
-                    
-                    # Mask user turn in labels
+                    # User turn: Mask everything
+                    turn_ids = user_header + content_ids + [im_end] + nl_ids
                     turn_labels = [-100] * len(turn_ids)
                     
-                elif role in ['gpt', 'chatgpt', 'assistant', 'model']:
-                    # Tokenize content
+                    input_ids.extend(turn_ids)
+                    labels.extend(turn_labels)
+                    
+                elif role in ['gpt', 'assistant']:
                     content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
                     
-                    # Full turn: Header + Content + End
-                    turn_ids = assistant_header + content_ids + [im_end, nl] # Note: usually \n after end
-                    
-                    # Train on assistant content only. 
-                    # Mask header? Usually yes.
-                    # Mask end? Usually no (predict EOS).
-                    
+                    # Assistant turn: Mask header, train on content
                     header_len = len(assistant_header)
-                    content_len = len(content_ids)
-                    end_len = 2 # <|im_end|>\n
+                    turn_ids = assistant_header + content_ids + [im_end] + nl_ids
                     
-                    # Mask header (-100), train on content + end tokens
                     turn_labels = (
-                        [-100] * header_len + 
-                        content_ids + 
-                        [im_end, nl]
+                        [-100] * header_len +
+                        content_ids +
+                        [im_end] + nl_ids
                     )
-                else:
-                    continue # Skip unknown roles (e.g. system)
-
-                input_ids.extend(turn_ids)
-                labels.extend(turn_labels)
+                    
+                    input_ids.extend(turn_ids)
+                    labels.extend(turn_labels)
 
             # Truncate
             max_len = 1024
@@ -151,7 +156,6 @@ class NanoVLMDataset(IterableDataset):
                 input_ids = input_ids[:max_len]
                 labels = labels[:max_len]
                 
-            # Drop if empty
             if len(input_ids) == 0:
                 return None
                 
@@ -160,7 +164,11 @@ class NanoVLMDataset(IterableDataset):
                 "labels": torch.tensor(labels, dtype=torch.long),
                 "pixel_values": pixel_values
             }
+
         except Exception as e:
+            print(f"      [DEBUG] Exception in process_item: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def __iter__(self):
