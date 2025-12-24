@@ -5,8 +5,10 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.model import NanoQwenVL, NanoQwenVLConfig
-from src.data import FineVisionDataset, collate_fn
+from src.data import NanoVLMDataset, collate_fn
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+from datasets import load_dataset
 import traceback
 
 def test_integration():
@@ -18,34 +20,47 @@ def test_integration():
     model = NanoQwenVL(config)
     print("Model initialized successfully.")
 
-    print("\n>>> Testing Dataset Loading (Mocking/Small)...")
-    # We use streaming=True to avoid downloading huge dataset for test
+    print("\n>>> Testing Dataset Loading with Streaming...")
+    # Test with dummy data instead of real dataset to avoid long downloads
     try:
-        ds = FineVisionDataset(split="train", dataset_name="HuggingFaceM4/FineVision", subset="CoSyn_400k_document")
-        # Just get one item
-        if hasattr(ds, 'is_streaming') and ds.is_streaming:
-            item = next(iter(ds.dataset)) # Streaming dataset is iterable
-            # Manually process one item as __getitem__ expects index but our logic for streaming in data.py was barebones
-            # Let's just assume we can get one item and pass to collate
-            pass
-        else:
-            # If not streaming (loading failed or we decided to load all), get index 0
-            if len(ds) > 0:
-                print("Dataset length:", len(ds))
-                item = ds[0]
-                batch = collate_fn([item])
-                
-                print("\n>>> Testing Forward Pass...")
-                with torch.no_grad():
-                    # Move to CPU for test
-                    outputs = model(**batch)
-                    print("Output logits shape:", outputs.logits.shape)
-                    print("Loss (if labels present):", outputs.loss)
+        print("Initializing tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+        
+        # Ensure pad token exists
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Add image placeholder token
+        if "<|image_pad|>" not in tokenizer.get_vocab():
+            tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+        
+        # Resize model embeddings to match tokenizer
+        model.llm.resize_token_embeddings(len(tokenizer))
+        
+        print("Loading streaming dataset (will only fetch 1 sample)...")
+        hf_dataset = load_dataset("HuggingFaceM4/FineVision", "CoSyn_400k_document", split="train", streaming=True)
+        
+        # Initialize NanoVLMDataset with the new API
+        ds = NanoVLMDataset(
+            dataset=hf_dataset,
+            tokenizer=tokenizer
+        )
+        
+        # Get one batch
+        dataloader = DataLoader(ds, batch_size=1, collate_fn=collate_fn, num_workers=0)
+        batch = next(iter(dataloader))
+        
+        print("\n>>> Testing Forward Pass with Real Data...")
+        with torch.no_grad():
+            outputs = model(**batch)
+            print("Output logits shape:", outputs.logits.shape)
+            print("Loss (if labels present):", outputs.loss)
+            
     except Exception as e:
         print(f"Dataset loading failed or skipped: {e}")
         traceback.print_exc()
         # Use dummy data if dataset fails
-        print("Using dummy data for model forward test...")
+        print("\nUsing dummy data for model forward test...")
         dummy_input_ids = torch.randint(0, 1000, (1, 10))
         dummy_pixel_values = torch.randn(1, 3, 384, 384)
         outputs = model(input_ids=dummy_input_ids, pixel_values=dummy_pixel_values)

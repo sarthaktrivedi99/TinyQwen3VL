@@ -45,6 +45,14 @@ class NanoVLMDataset(IterableDataset):
     def process_item(self, item):
         """
         Processes a single raw item into a tensor dictionary.
+        Supports ShareGPT format:
+        {
+            "image": "path/to/img" or url,
+            "conversations": [
+                {"from": "human", "value": "..."},
+                {"from": "gpt", "value": "..."}
+            ]
+        }
         """
         try:
             # --- A. Image Handling ---
@@ -63,38 +71,94 @@ class NanoVLMDataset(IterableDataset):
             # Apply Vision Transform -> [3, 384, 384]
             pixel_values = self.transform(image) 
 
-            # --- B. Text Handling ---
+            # --- B. Parse Conversations (ShareGPT) ---
+            # Fallback for pure text datasets or simple Q&A keys if strictly needed, 
+            # but we assume ShareGPT format as primary now.
+            conversations = item.get('conversations', [])
+            if not conversations:
+                # Minimal fallback if user didn't update data yet to avoid total crash
+                if 'question' in item and 'answer' in item:
+                    conversations = [
+                        {"from": "human", "value": item['question']},
+                        {"from": "gpt", "value": item['answer']}
+                    ]
+                else:
+                    return None
+
+            # --- C. Tokenization & Masking (Multi-turn) ---
             image_placeholders = self.img_token_str * self.vision_config['num_tokens']
             
-            # Extract Q&A (Generic robust extractor)
-            question = "Describe this document." 
-            answer = "Content not available."
+            input_ids = []
+            labels = []
             
-            if 'question' in item and 'answer' in item:
-                question = item['question']
-                answer = item['answer']
-            elif 'texts' in item and isinstance(item['texts'], list) and len(item['texts']) > 0:
-                t = item['texts'][0] 
-                question = t.get('user', question)
-                answer = t.get('assistant', answer)
+            # ChatML delimiters
+            im_start = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+            im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            nl = self.tokenizer.convert_tokens_to_ids("\n")
+            
+            # Pre-tokenized role headers
+            user_header = [im_start] + self.tokenizer("user", add_special_tokens=False).input_ids + [nl]
+            assistant_header = [im_start] + self.tokenizer("assistant", add_special_tokens=False).input_ids + [nl]
+            
+            # Inject image into first user turn
+            first_user_turn = True
+            
+            for msg in conversations:
+                role = msg.get('from', '').lower()
+                content = msg.get('value', '').strip()
+                
+                # Check for image placeholder manually if needed, or auto-inject
+                # We auto-inject at start of first user message
+                if role in ['human', 'user']:
+                    if first_user_turn:
+                        content = f"{image_placeholders}\n{content}"
+                        first_user_turn = False
+                        
+                    # Tokenize content
+                    content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
+                    
+                    # Full turn: Header + Content + End
+                    turn_ids = user_header + content_ids + [im_end, nl]
+                    
+                    # Mask user turn in labels
+                    turn_labels = [-100] * len(turn_ids)
+                    
+                elif role in ['gpt', 'chatgpt', 'assistant', 'model']:
+                    # Tokenize content
+                    content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
+                    
+                    # Full turn: Header + Content + End
+                    turn_ids = assistant_header + content_ids + [im_end, nl] # Note: usually \n after end
+                    
+                    # Train on assistant content only. 
+                    # Mask header? Usually yes.
+                    # Mask end? Usually no (predict EOS).
+                    
+                    header_len = len(assistant_header)
+                    content_len = len(content_ids)
+                    end_len = 2 # <|im_end|>\n
+                    
+                    # Mask header (-100), train on content + end tokens
+                    turn_labels = (
+                        [-100] * header_len + 
+                        content_ids + 
+                        [im_end, nl]
+                    )
+                else:
+                    continue # Skip unknown roles (e.g. system)
 
-            # ChatML Formatting
-            # Structure: <|im_start|>user\n <image_tokens> \n Question <|im_end|>\n <|im_start|>assistant\n Answer <|im_end|>
-            user_text = f"<|im_start|>user\n{image_placeholders}\n{question}<|im_end|>\n<|im_start|>assistant\n"
-            assistant_text = f"{answer}<|im_end|>"
-            
-            # --- C. Tokenization ---
-            user_tokens = self.tokenizer(user_text, add_special_tokens=False).input_ids
-            assistant_tokens = self.tokenizer(assistant_text, add_special_tokens=False).input_ids
-            
-            input_ids = user_tokens + assistant_tokens
-            labels = [-100] * len(user_tokens) + assistant_tokens
-            
+                input_ids.extend(turn_ids)
+                labels.extend(turn_labels)
+
             # Truncate
             max_len = 1024
             if len(input_ids) > max_len:
                 input_ids = input_ids[:max_len]
                 labels = labels[:max_len]
+                
+            # Drop if empty
+            if len(input_ids) == 0:
+                return None
                 
             return {
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
