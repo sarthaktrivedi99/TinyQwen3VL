@@ -15,7 +15,7 @@ def test_integration():
     print(">>> Testing Model Initialization...")
     config = NanoQwenVLConfig(
         llm_model_id="Qwen/Qwen3-0.6B",
-        vision_model_id="hf-hub:timm/PE-Core-S-16-384",
+        vision_model_id="moonshotai/MoonViT-SO-400M",
     )
     model = NanoQwenVL(config)
     print("Model initialized successfully.")

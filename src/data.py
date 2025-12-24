@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import IterableDataset
-from transformers import AutoTokenizer
-import open_clip
+from transformers import AutoTokenizer, AutoImageProcessor
 from PIL import Image
 import numpy as np
 
@@ -9,10 +8,8 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------
 VISION_CONFIG = {
-    "model_id": "hf-hub:timm/PE-Core-S-16-384",
-    "image_size": 384,
-    "patch_size": 16,
-    "num_tokens": (384 // 16) ** 2  # 576 tokens
+    "model_id": "moonshotai/MoonViT-SO-400M",
+    "vision_dim": 1152,
 }
 
 class NanoVLMDataset(IterableDataset):
@@ -21,11 +18,11 @@ class NanoVLMDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.vision_config = vision_config
         
-        # Load vision transform upfront to avoid lazy loading issues
-        print(f"Loading Vision Transforms for {vision_config['model_id']}...")
-        _, _, self.transform = open_clip.create_model_and_transforms(
+        # Load MoonViT image processor
+        print(f"Loading Image Processor for {vision_config['model_id']}...")
+        self.image_processor = AutoImageProcessor.from_pretrained(
             vision_config['model_id'], 
-            pretrained=None
+            trust_remote_code=True
         )
         
         # Setup Special Token
@@ -45,12 +42,9 @@ class NanoVLMDataset(IterableDataset):
         Format:
         {
             "images": [PIL.Image, ...],
-            "texts": ["Text content...", ...],
+            "texts": [{"user": "...", "assistant": "..."}, ...],
             ...
         }
-        We treat this as a document parsing task:
-        User: <|image_pad|>
-        Assistant: <text>
         """
         try:
             # --- A. Image Handling ---
@@ -73,8 +67,11 @@ class NanoVLMDataset(IterableDataset):
             else:
                 image = image.convert('RGB')
             
-            # Apply Vision Transform -> [3, 384, 384]
-            pixel_values = self.transform(image) 
+            # Process image with MoonViT processor
+            # Returns pixel_values and image_grid_hws
+            image_inputs = self.image_processor([image], return_tensors="pt")
+            pixel_values = image_inputs['pixel_values'].squeeze(0)  # Remove batch dim
+            image_grid_hws = image_inputs['image_grid_hws']  # List of (H, W) tuples
 
             # --- B. Text Handling ---
             # FineVision uses 'texts' list of dicts: [{'user': '...', 'assistant': '...'}]
@@ -95,7 +92,9 @@ class NanoVLMDataset(IterableDataset):
                 return None
             
             # --- C. Tokenization & Masking ---
-            image_placeholders = self.img_token_str * self.vision_config['num_tokens']
+            # For MoonViT, we don't inject image placeholders into text
+            # Instead, image embeddings are prepended in the model's forward pass
+            # So we just tokenize the conversation normally
             
             # ChatML delimiters
             im_start = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -111,9 +110,6 @@ class NanoVLMDataset(IterableDataset):
             input_ids = []
             labels = []
             
-            # Inject image into first user turn
-            first_user_turn = True
-            
             # Iterate through turns (user -> assistant -> user -> assistant)
             # We assume the list is ordered: human, gpt, human, gpt...
             for idx, msg in enumerate(conversations):
@@ -121,11 +117,6 @@ class NanoVLMDataset(IterableDataset):
                 content = msg.get('value', '').strip()
                 
                 if role in ['human', 'user']:
-                    # Inject image in first human turn
-                    if first_user_turn:
-                        content = f"{image_placeholders}\n{content}"
-                        first_user_turn = False
-                        
                     content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
                     # User turn: Mask everything
                     turn_ids = user_header + content_ids + [im_end] + nl_ids
@@ -162,7 +153,8 @@ class NanoVLMDataset(IterableDataset):
             return {
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
                 "labels": torch.tensor(labels, dtype=torch.long),
-                "pixel_values": pixel_values
+                "pixel_values": pixel_values,
+                "image_grid_hws": image_grid_hws,
             }
 
         except Exception as e:
@@ -181,16 +173,30 @@ class NanoVLMDataset(IterableDataset):
                 yield processed
 
 # ---------------------------------------------------------
-# Data Collator (Standard Padding)
+# Data Collator (Handles variable-length image tokens)
 # ---------------------------------------------------------
 def collate_fn(batch):
-    # Filter out any Nones that might have slipped through (though __iter__ handles it mostly)
+    # Filter out any Nones
     batch = [item for item in batch if item is not None]
     if len(batch) == 0:
         return {}
 
-    # Stack images
-    pixel_values = torch.stack([item['pixel_values'] for item in batch])
+    # Stack/concatenate pixel values
+    # MoonViT pixel_values may have variable shapes, so we concatenate along batch dim
+    pixel_values = torch.cat([item['pixel_values'].unsqueeze(0) if item['pixel_values'].dim() == 3 
+                              else item['pixel_values'] for item in batch], dim=0)
+    
+    # Collect image_grid_hws (list of tuples)
+    image_grid_hws = []
+    for item in batch:
+        if isinstance(item['image_grid_hws'], torch.Tensor):
+            image_grid_hws.append(item['image_grid_hws'])
+        else:
+            image_grid_hws.extend(item['image_grid_hws'])
+    
+    # Stack if tensors
+    if image_grid_hws and isinstance(image_grid_hws[0], torch.Tensor):
+        image_grid_hws = torch.cat(image_grid_hws, dim=0)
     
     # Pad input_ids and labels
     # padding_value for input_ids is 0 (or tokenizer.pad_token_id)
@@ -205,5 +211,6 @@ def collate_fn(batch):
         "input_ids": padded_input_ids,
         "labels": padded_labels,
         "pixel_values": pixel_values,
+        "image_grid_hws": image_grid_hws,
         "attention_mask": (padded_input_ids != 0).long()
     }
