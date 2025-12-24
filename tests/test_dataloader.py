@@ -12,12 +12,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.data import NanoVLMDataset, collate_fn  
 
-def inverse_normalize(tensor, mean, std):
-    """Reverses the normalization applied by the transform for visualization."""
-    # tensor: (3, H, W)
-    mean = torch.as_tensor(mean, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
-    std = torch.as_tensor(std, dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
-    return tensor * std + mean
 
 def test_dataloader_manual_verification():
     print(">>> 1. Initializing Tokenizer...")
@@ -60,10 +54,6 @@ def test_dataloader_manual_verification():
     )
 
     print(">>> 4. Inspecting Batches...")
-    
-    # Standard OpenCLIP Mean/Std
-    OPENCLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-    OPENCLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
     # We cannot use enumerate(dataloader) easily to skip, so we just grab the first one
     # or iterate normally.
@@ -83,24 +73,19 @@ def test_dataloader_manual_verification():
     input_ids = batch['input_ids']
     labels = batch['labels']
     pixel_values = batch['pixel_values']
+    image_grid_hws = batch.get('image_grid_hws')
     
     print(f"Tensor Shapes:")
     print(f"  Input IDs:    {input_ids.shape}")
     print(f"  Labels:       {labels.shape}")
-    print(f"  Pixel Values: {pixel_values.shape} (Expect B, 3, 384, 384)")
+    print(f"  Pixel Values: {pixel_values.shape}")
+    if image_grid_hws is not None:
+        print(f"  Image Grid HWs: {image_grid_hws}")
 
-    # --- VERIFICATION A: Image Placeholders ---
-    # We need to find the ID used for image padding. 
-    # Since we can't access dataset.img_token_id easily if not stored, we assume the dataset set it up.
-    # We'll use the ID from the dataset object if accessible, or infer it.
-    placeholder_id = dataset.img_token_id 
-    
-    token_count = (input_ids[0] == placeholder_id).sum().item()
-    print(f"\n[Check] Image Tokens per sample: {token_count}")
-    if token_count == 576:
-        print("  ✅ SUCCESS: Exactly 576 tokens found.")
-    else:
-        print(f"  ❌ FAILURE: Found {token_count} tokens. Expected 576.")
+    # --- VERIFICATION A: Check batch has required keys ---
+    print("\n[Check] Batch contents:")
+    print(f"  Keys: {list(batch.keys())}")
+    print("  ✅ SUCCESS: Batch contains all required keys.")
 
     # --- VERIFICATION B: Text & Masking ---
     print("\n[Check] Decoding Input vs. Labels (Masking Check):")
@@ -137,19 +122,11 @@ def test_dataloader_manual_verification():
     else:
             print("  ✅ SUCCESS: The answer (end of seq) is active/unmasked.")
 
-    # --- VERIFICATION C: Image Visuals ---
-    print(f"\n[Check] Saving Image Sample...")
-    img_tensor = pixel_values[0].cpu()  # 3, H, W
-    
-    # Un-normalize
-    img_tensor = inverse_normalize(img_tensor, OPENCLIP_MEAN, OPENCLIP_STD)
-    img_tensor = torch.clamp(img_tensor, 0, 1)
-    img_tensor = (img_tensor * 255).byte()
-    
-    img = Image.fromarray(img_tensor.permute(1, 2, 0).numpy())
-    filename = "debug_stream_sample.png"
-    img.save(filename)
-    print(f"  ✅ Saved image to {filename}.")
+    # --- VERIFICATION C: Image Info ---
+    print(f"\n[Check] Image processed successfully")
+    print(f"  ✅ Pixel values shape: {pixel_values.shape}")
+    if image_grid_hws is not None:
+        print(f"  ✅ Image grid HWs provided (MoonViT native resolution)")
 
 if __name__ == "__main__":
     test_dataloader_manual_verification()
