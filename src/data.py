@@ -20,7 +20,13 @@ class NanoVLMDataset(IterableDataset):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.vision_config = vision_config
-        self._transform = None  # Lazy initialization for multiprocessing efficiency
+        
+        # Load vision transform upfront to avoid lazy loading issues
+        print(f"Loading Vision Transforms for {vision_config['model_id']}...")
+        _, _, self.transform = open_clip.create_model_and_transforms(
+            vision_config['model_id'], 
+            pretrained=None
+        )
         
         # Setup Special Token
         # If <|image_pad|> isn't found, fallback to unk_token (but ideally it should be added in train.py)
@@ -29,18 +35,7 @@ class NanoVLMDataset(IterableDataset):
             self.img_token_str = tokenizer.unk_token
         else:
             self.img_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
-            self.img_token_str = "<|image_pad|>"
-    
-    @property
-    def transform(self):
-        """Lazy load vision transform to reduce worker initialization overhead."""
-        if self._transform is None:
-            print(f"Loading Vision Transforms for {self.vision_config['model_id']}...")
-            _, _, self._transform = open_clip.create_model_and_transforms(
-                self.vision_config['model_id'], 
-                pretrained=None
-            )
-        return self._transform 
+            self.img_token_str = "<|image_pad|>" 
 
     def process_item(self, item):
         """
