@@ -22,22 +22,31 @@ def inverse_normalize(tensor, mean, std):
 def test_dataloader_manual_verification():
     print(">>> 1. Initializing Tokenizer...")
     
-    tokenizer_id = "Qwen/Qwen2.5-0.5B-Instruct" 
+    tokenizer_id = "Qwen/Qwen3-0.6B" 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
     
     # Ensure pad token exists
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        
-    print(">>> 2. Initializing Streaming Dataset...")
-    # Load in streaming mode (Iterable)
-    # We take a small slice just to ensure we don't stream forever if something goes wrong,
-    # but practically we just stop after the first batch.
-    hf_dataset_stream = load_dataset("HuggingFaceM4/FineVision", "CoSyn_400k_document", split="train", streaming=True)
+    
+    # Add image placeholder token
+    if "<|image_pad|>" not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+    
+    print(">>> 2. Initializing Dataset...")
+    # Download a small subset instead of streaming to avoid hanging
+    # We take just the first 10 samples for testing
+    print("   Downloading first 10 samples from dataset (this may take a moment)...")
+    hf_dataset = load_dataset(
+        "HuggingFaceM4/FineVision", 
+        "CoSyn_400k_document", 
+        split="train[:10]",  # Only download first 10 samples
+        streaming=False  # Force download instead of streaming
+    )
     
     # Initialize your NanoVLMDataset (which is now an IterableDataset)
     dataset = NanoVLMDataset(
-        dataset=hf_dataset_stream, 
+        dataset=hf_dataset, 
         tokenizer=tokenizer
     )
 
