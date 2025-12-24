@@ -62,8 +62,20 @@ def test_integration():
         # Use dummy data if dataset fails
         print("\nUsing dummy data for model forward test...")
         dummy_input_ids = torch.randint(0, 1000, (1, 10))
-        dummy_pixel_values = torch.randn(1, 3, 384, 384)
-        outputs = model(input_ids=dummy_input_ids, pixel_values=dummy_pixel_values)
+        dummy_pixel_values = torch.randn(1, 400, 1152).to(dtype=torch.bfloat16) # Mock MoonViT features directly? 
+        # Or pass pixel_values that trigger vision tower input?
+        # If we pass pixel_values, it goes to vision tower. Input to vision tower: [1, 3, H, W]
+        # But wait, dummy fallback usually skips complex logic. 
+        # Let's mock the expected input for NanoQwenVL forward:
+        # pixel_values should be [Num_Patches, 3, 14, 14]
+        # For 378x378 image -> 27x27 grid -> 729 patches
+        num_patches = 27 * 27
+        dummy_pixel_values = torch.randn(num_patches, 3, 14, 14)
+        
+        # MoonViT needs grid_hws for 378x378 -> 27x27 grid
+        dummy_grid_hws = torch.tensor([[27, 27]])
+        
+        outputs = model(input_ids=dummy_input_ids, pixel_values=dummy_pixel_values, image_grid_hws=dummy_grid_hws)
         print("Dummy Output logits shape:", outputs.logits.shape)
 
 if __name__ == "__main__":

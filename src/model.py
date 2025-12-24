@@ -75,16 +75,14 @@ class NanoQwenVL(PreTrainedModel):
         print(f"Loading LLM: {config.llm_model_id}...")
         self.llm = AutoModelForCausalLM.from_pretrained(
             config.llm_model_id, 
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16
+            trust_remote_code=True
         )
         
         # Load MoonViT (Needs trust_remote_code=True)
         print(f"Loading Vision Model: {config.vision_model_id}...")
         self.vision_tower = AutoModel.from_pretrained(
             config.vision_model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16
+            trust_remote_code=True
         )
 
         if config.freeze_vision:
@@ -203,6 +201,9 @@ class NanoQwenVL(PreTrainedModel):
             return_dict=True,
             **kwargs
         )
+
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return self.llm.prepare_inputs_for_generation(input_ids, **kwargs)
 
     @torch.no_grad()
     def generate(
