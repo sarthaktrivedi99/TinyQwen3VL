@@ -27,6 +27,10 @@ def test_dataloader_manual_verification():
     if "<|image_pad|>" not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
     
+    print("\n>>> Verifying token count...")
+    # PE-Core with NaFlex produces variable token count based on image size
+    print("  With PE-Core NaFlex, token count varies with input image resolution")
+    
     print(">>> 2. Initializing Dataset...")
     # Download a small subset instead of streaming to avoid hanging
     # We take just the first 10 samples for testing
@@ -67,7 +71,20 @@ def test_dataloader_manual_verification():
         print(f"❌ Error fetching batch: {e}")
         import traceback
         traceback.print_exc()
-        return
+    # Inspect the first batch
+    print("\n>>> Inspecting first batch...")
+    required_keys = {'input_ids', 'labels', 'pixel_values', 'attention_mask'}
+    print(f"Batch keys: {batch.keys()}")
+    assert required_keys.issubset(batch.keys()), f"Missing keys: {required_keys - set(batch.keys())}"
+    
+    print(f"  input_ids shape: {batch['input_ids'].shape}")
+    print(f"  labels shape: {batch['labels'].shape}")
+    print(f"  pixel_values shape: {batch['pixel_values'].shape}")
+    print(f"  attention_mask shape: {batch['attention_mask'].shape}")
+    
+    # PE-Core expects fixed [B, C, H, W] pixel values
+    assert batch['pixel_values'].dim() == 4, "pixel_values should be 4D [B, C, H, W]"
+    assert batch['pixel_values'].shape[1:] == (3, 384, 384), "Expected 3x384x384 images with PE-Core"
 
     print(f"\n=== Batch Analysis ===")
     input_ids = batch['input_ids']
@@ -127,6 +144,12 @@ def test_dataloader_manual_verification():
     print(f"  ✅ Pixel values shape: {pixel_values.shape}")
     if image_grid_hws is not None:
         print(f"  ✅ Image grid HWs provided (MoonViT native resolution)")
+
+# PE-Core Configuration
+VISION_CONFIG = {
+    "model_id": "vit_pe_core_small_patch16_384.fb",
+    "vision_dim": 384,  # PE-Core small embedding dimension
+}
 
 if __name__ == "__main__":
     test_dataloader_manual_verification()

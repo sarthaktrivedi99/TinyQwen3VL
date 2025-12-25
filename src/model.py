@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
+import timm
+from timm.data import resolve_model_data_config, create_transform
 from transformers import (
     AutoModelForCausalLM, 
-    AutoModel,
     PreTrainedModel, 
     PretrainedConfig, 
-    AutoTokenizer,
-    AutoImageProcessor
+    AutoTokenizer
 )
 from typing import Optional, List, Union
 from PIL import Image
@@ -19,7 +19,7 @@ class NanoQwenVLConfig(PretrainedConfig):
     def __init__(
         self,
         llm_model_id="Qwen/Qwen3-0.6b",
-        vision_model_id="moonshotai/MoonViT-SO-400M", # <--- Switched to MoonViT
+        vision_model_id="vit_pe_core_small_patch16_384.fb",
         freeze_vision=True,
         freeze_llm=False,
         **kwargs
@@ -31,16 +31,16 @@ class NanoQwenVLConfig(PretrainedConfig):
         self.freeze_llm = freeze_llm
 
 # -----------------------------------------------------------------------------
-# 2. Processor (Simplifed for MoonViT)
+# 2. Processor (Using TIMM for PE-Core)
 # -----------------------------------------------------------------------------
 class NanoQwenProcessor:
     def __init__(self, vision_model_id, llm_model_id):
-        # MoonViT has a custom image processor that handles native resolution logic
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            vision_model_id, 
-            trust_remote_code=True
-        )
+        # PE-Core uses TIMM transforms
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_id)
+        
+        # Get transform from TIMM
+        data_config = resolve_model_data_config(timm.create_model(vision_model_id, pretrained=False))
+        self.image_transform = create_transform(**data_config, is_training=False)
 
     def __call__(self, text: Union[str, List[str]], images: Union[Image.Image, List[Image.Image]] = None):
         if isinstance(text, str):
@@ -51,13 +51,11 @@ class NanoQwenProcessor:
         # 1. Process Text
         inputs = self.tokenizer(text, return_tensors="pt", padding=True)
         
-        # 2. Process Images (Native Resolution)
+        # 2. Process Images
         if images:
-            # MoonViT processor returns 'pixel_values' and 'image_grid_hws'
-            image_inputs = self.image_processor(images, return_tensors="pt")
-            
-            inputs['pixel_values'] = image_inputs['pixel_values']
-            inputs['image_grid_hws'] = image_inputs['image_grid_hws'] # Vital for MoonViT
+            # Apply TIMM transform and stack
+            pixel_values = torch.stack([self.image_transform(img) for img in images])
+            inputs['pixel_values'] = pixel_values
 
         return inputs
 
@@ -78,11 +76,14 @@ class NanoQwenVL(PreTrainedModel):
             trust_remote_code=True
         )
         
-        # Load MoonViT (Needs trust_remote_code=True)
+        # Load PE-Core from TIMM
         print(f"Loading Vision Model: {config.vision_model_id}...")
-        self.vision_tower = AutoModel.from_pretrained(
+        self.vision_tower = timm.create_model(
             config.vision_model_id,
-            trust_remote_code=True
+            pretrained=True,
+            use_naflex=True,  # Enable NaFlex for flexible resolution
+            num_classes=0,  # Remove classification head, return features
+            global_pool=''  # Disable pooling to get patch-level features [B, num_patches, embed_dim]
         )
 
         if config.freeze_vision:
@@ -91,8 +92,8 @@ class NanoQwenVL(PreTrainedModel):
             self.llm.requires_grad_(False)
 
         # Dimensions
-        # MoonViT-SO-400M output dim is 1152 (same as SigLIP)
-        self.vision_dim = 1152 
+        # PE-Core small outputs 384-dim embeddings
+        self.vision_dim = 384
         self.llm_dim = self.llm.config.hidden_size
         
         # Projector
@@ -106,7 +107,6 @@ class NanoQwenVL(PreTrainedModel):
         self,
         input_ids=None,
         pixel_values=None,
-        image_grid_hws=None, # <--- New argument required by MoonViT
         attention_mask=None,
         labels=None,
         **kwargs
@@ -116,42 +116,22 @@ class NanoQwenVL(PreTrainedModel):
         
         if pixel_values is not None:
             # 1. Forward Vision Tower
-            # MoonViT forward signature: (pixel_values, image_grid_hws)
-            # It returns a list of tensors (one per image) because lengths vary
-            # Each tensor has shape [num_tokens, num_sub_patches, vision_dim] e.g., [1092, 4, 1152]
-            vision_outputs = self.vision_tower(pixel_values, image_grid_hws)
+            # PE-Core outputs: [batch, num_tokens, vision_dim] e.g., [B, 576, 768]
+            vision_outputs = self.vision_tower(pixel_values)
             
-            image_embeds_list = []
+            # 2. Project to LLM dimension [batch, num_tokens, llm_dim]
+            image_embeds = self.projector(vision_outputs)  # [B, 576, LLM_Dim]
             
-            # Process each image feature independently
-            for i, vis_feat in enumerate(vision_outputs):
-                # vis_feat shape: [Num_Tokens, 4, 1152]
-                # Flatten the sub-patch dimension: [Num_Tokens * 4, 1152]
-                if vis_feat.dim() == 3:
-                    num_tokens, num_sub, dim = vis_feat.shape
-                    vis_feat = vis_feat.reshape(num_tokens * num_sub, dim)
-                
-                # Project to LLM dimension
-                proj_feat = self.projector(vis_feat)  # [Num_Tokens * 4, LLM_Dim]
-                image_embeds_list.append(proj_feat)
-
-            # 2. Merge into LLM sequence
-            # Simplified Strategy: Prepend to text.
-            # Since batch items have different image token lengths, we have to construct
-            # the inputs_embeds batch carefully or use left-padding.
-            
-            # Simple approach: Create a new inputs_embeds tensor
-            # We assume Batch Size is 1 for "Nano" demo simplicity, 
-            # or we handle padding manually.
-            
+            # 3. Merge into LLM sequence
+            # Prepend image embeddings to text for each item in batch
             new_inputs_embeds = []
             new_attention_mask = []
             new_labels = []
 
             for i in range(len(inputs_embeds)):
                 # Get components for this batch item
-                txt_emb = inputs_embeds[i] # [Seq, Dim]
-                img_emb = image_embeds_list[i] # [Img_Seq, Dim]
+                txt_emb = inputs_embeds[i]  # [Seq, Dim]
+                img_emb = image_embeds[i]    # [576, Dim]
                 
                 # Concatenate [Image, Text]
                 combined_emb = torch.cat([img_emb, txt_emb], dim=0)
@@ -173,7 +153,6 @@ class NanoQwenVL(PreTrainedModel):
                     new_labels.append(combined_lbl)
 
             # Pad the batch to the longest sequence
-            # (Use torch.nn.utils.rnn.pad_sequence or manual padding)
             from torch.nn.utils.rnn import pad_sequence
             
             inputs_embeds = pad_sequence(new_inputs_embeds, batch_first=True)
@@ -189,10 +168,10 @@ class NanoQwenVL(PreTrainedModel):
         kwargs.pop('attention_mask', None) 
         kwargs.pop('labels', None)
         kwargs.pop('input_ids', None)
+        kwargs.pop('return_dict', None)
         
         # Explicitly remove vision args so LLM doesn't complain
         kwargs.pop('pixel_values', None)
-        kwargs.pop('image_grid_hws', None)
 
         return self.llm(
             inputs_embeds=inputs_embeds,
@@ -210,7 +189,6 @@ class NanoQwenVL(PreTrainedModel):
         self,
         input_ids=None,
         pixel_values=None,
-        image_grid_hws=None,
         attention_mask=None,
         **kwargs
     ):
@@ -218,19 +196,15 @@ class NanoQwenVL(PreTrainedModel):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
         if pixel_values is not None:
-            vision_outputs = self.vision_tower(pixel_values, image_grid_hws)
+            # PE-Core forward: [batch, num_tokens, vision_dim]
+            vision_outputs = self.vision_tower(pixel_values)
+            image_embeds = self.projector(vision_outputs)  # [B, 576, LLM_Dim]
             
             new_inputs_embeds = []
             new_attention_mask = []
             
             for i in range(len(inputs_embeds)):
-                vis_feat = vision_outputs[i]
-                # Flatten 3D output: [Num_Tokens, 4, 1152] -> [Num_Tokens * 4, 1152]
-                if vis_feat.dim() == 3:
-                    num_tokens, num_sub, dim = vis_feat.shape
-                    vis_feat = vis_feat.reshape(num_tokens * num_sub, dim)
-                
-                img_emb = self.projector(vis_feat)
+                img_emb = image_embeds[i]  # [576, Dim]
                 txt_emb = inputs_embeds[i]
                 
                 combined_emb = torch.cat([img_emb, txt_emb], dim=0)

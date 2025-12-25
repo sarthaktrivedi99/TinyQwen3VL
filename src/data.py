@@ -1,15 +1,17 @@
 import torch
 from torch.utils.data import IterableDataset
-from transformers import AutoTokenizer, AutoImageProcessor
+from transformers import AutoTokenizer
 from PIL import Image
 import numpy as np
+import timm
+from timm.data import resolve_model_data_config, create_transform
 
 # ---------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------
 VISION_CONFIG = {
-    "model_id": "moonshotai/MoonViT-SO-400M",
-    "vision_dim": 1152,
+    "model_id": "vit_pe_core_small_patch16_384.fb",
+    "vision_dim": 384,  # PE-Core small embedding dimension
 }
 
 class NanoVLMDataset(IterableDataset):
@@ -18,15 +20,13 @@ class NanoVLMDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.vision_config = vision_config
         
-        # Load MoonViT image processor
+        # Load PE-Core transforms from TIMM
         print(f"Loading Image Processor for {vision_config['model_id']}...")
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            vision_config['model_id'], 
-            trust_remote_code=True
-        )
+        model = timm.create_model(vision_config['model_id'], pretrained=False)
+        data_config = resolve_model_data_config(model)
+        self.image_transform = create_transform(**data_config, is_training=False)
         
         # Setup Special Token
-        # If <|image_pad|> isn't found, fallback to unk_token (but ideally it should be added in train.py)
         if "<|image_pad|>" not in tokenizer.get_vocab():
             self.img_token_id = tokenizer.unk_token_id
             self.img_token_str = tokenizer.unk_token
@@ -67,13 +67,8 @@ class NanoVLMDataset(IterableDataset):
             else:
                 image = image.convert('RGB')
             
-            # Process image with MoonViT processor
-            # Returns pixel_values and image_grid_hws
-            image_inputs = self.image_processor([image], return_tensors="pt")
-            # Keep pixel_values with batch dim for proper batching later
-            pixel_values = image_inputs['pixel_values']  # [1, C, H, W] or similar
-            # image_grid_hws is a tensor of shape [N, 2] where N = num images
-            image_grid_hws = image_inputs['image_grid_hws']  # Tensor[N, 2]
+            # Process image with TIMM transform
+            pixel_values = self.image_transform(image)  # Returns [C, H, W]
 
             # --- B. Text Handling ---
             # FineVision uses 'texts' list of dicts: [{'user': '...', 'assistant': '...'}]
@@ -156,7 +151,6 @@ class NanoVLMDataset(IterableDataset):
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
                 "labels": torch.tensor(labels, dtype=torch.long),
                 "pixel_values": pixel_values,
-                "image_grid_hws": image_grid_hws,
             }
 
         except Exception as e:
@@ -183,41 +177,11 @@ def collate_fn(batch):
     if len(batch) == 0:
         return {}
 
-    # Concatenate pixel values along batch dim
-    # Each item has pixel_values of shape [1, ...] or [C, H, W]
-    pixel_values_list = []
-    print(f"\n[DEBUG Collate] Batch size: {len(batch)}")
-    for i, item in enumerate(batch):
-        pv = item['pixel_values']
-        hws = item['image_grid_hws']
-        print(f"  Item {i} PV shape: {pv.shape}, HWs: {hws}")
-        
-        if pv.dim() == 3:  # [C, H, W] -> [1, C, H, W]
-            pv = pv.unsqueeze(0)
-        pixel_values_list.append(pv)
-    pixel_values = torch.cat(pixel_values_list, dim=0)
-    
-    # Concatenate image_grid_hws tensors
-    image_grid_hws_list = []
-    for item in batch:
-        hws = item['image_grid_hws']
-        if isinstance(hws, torch.Tensor):
-            image_grid_hws_list.append(hws)
-        elif isinstance(hws, list) and len(hws) > 0:
-            image_grid_hws_list.append(torch.tensor(hws))
-    
-    if image_grid_hws_list:
-        image_grid_hws = torch.cat(image_grid_hws_list, dim=0)
-    else:
-        image_grid_hws = None
-        
-    print(f"  Final PV shape: {pixel_values.shape}")
-    if image_grid_hws is not None:
-         print(f"  Final HWs shape: {image_grid_hws.shape}, Values: {image_grid_hws}")
+    # Stack pixel values (all same size with PE-Core)
+    # Each item has pixel_values of shape [C, H, W]
+    pixel_values = torch.stack([item['pixel_values'] for item in batch])  # [B, C, H, W]
     
     # Pad input_ids and labels
-    # padding_value for input_ids is 0 (or tokenizer.pad_token_id)
-    # padding_value for labels is -100 (ignore index)
     input_ids = [item['input_ids'] for item in batch]
     labels = [item['labels'] for item in batch]
     
@@ -228,6 +192,5 @@ def collate_fn(batch):
         "input_ids": padded_input_ids,
         "labels": padded_labels,
         "pixel_values": pixel_values,
-        "image_grid_hws": image_grid_hws,
         "attention_mask": (padded_input_ids != 0).long()
     }
