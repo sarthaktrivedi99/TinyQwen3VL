@@ -16,6 +16,7 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout (default: 0.1)")
     parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for training (default: True)")
     parser.add_argument("--no_lora", action="store_true", help="Disable LoRA (full fine-tuning)")
+    parser.add_argument("--lora_vision", action="store_true", help="Enable LoRA for vision backbone (default: False)")
     
     # DeepSpeed arguments
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config JSON file")
@@ -83,19 +84,26 @@ def train():
     if use_lora:
         print(f"Applying LoRA (r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout})...")
         
+        # LLM target modules (standard Qwen)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        
+        # Add vision backbone modules if enabled
+        if args.lora_vision:
+            print("  -> Including vision backbone in LoRA training")
+            # TIMM ViT attention modules (qkv is combined, proj is output)
+            target_modules.extend(["qkv", "proj", "fc1", "fc2"])
+        
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, 
             inference_mode=False, 
             r=args.lora_r, 
             lora_alpha=args.lora_alpha, 
             lora_dropout=args.lora_dropout,
-            # Standard Qwen target modules
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=target_modules,
             
             # CRITICAL: The projector is new/random and MUST be trained.
             # "modules_to_save" ensures these layers remain trainable and are saved 
             # in the adapter checkpoint, not ignored.
-            # Check your src.model source code to ensure the attribute is named 'projector'.
             modules_to_save=["projector"] 
         )
         
