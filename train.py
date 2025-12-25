@@ -109,11 +109,17 @@ def train():
         # LLM target modules (standard Qwen)
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         
-        # Add vision backbone modules if enabled
+        # Add vision backbone modules if enabled (using regex to target vision_tower specifically)
         if args.lora_vision:
             print("  -> Including vision backbone in LoRA training")
-            # TIMM ViT attention modules (qkv is combined, proj is output)
-            target_modules.extend(["qkv", "proj", "fc1", "fc2"])
+            # Use regex patterns to specifically target vision_tower modules
+            # This avoids conflicts with LLM modules that have similar names
+            target_modules.extend([
+                r"vision_tower\.blocks\.\d+\.attn\.qkv",     # Attention QKV
+                r"vision_tower\.blocks\.\d+\.attn\.proj",    # Attention output projection
+                r"vision_tower\.blocks\.\d+\.mlp\.fc1",      # MLP first layer
+                r"vision_tower\.blocks\.\d+\.mlp\.fc2",      # MLP second layer
+            ])
         
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, 
