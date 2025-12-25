@@ -66,7 +66,7 @@ def train():
     print("Initialize Model...")
     config = NanoQwenVLConfig(
         llm_model_id=llm_model_id,
-        vision_model_id="moonshotai/MoonViT-SO-400M",
+        vision_model_id="vit_pe_core_small_patch16_384.fb",
         freeze_vision=True, 
         freeze_llm=False # We let PEFT handle the freezing
     )
