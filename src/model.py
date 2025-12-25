@@ -110,6 +110,14 @@ class NanoQwenVL(PreTrainedModel):
             nn.Linear(self.llm_dim, self.llm_dim)
         )
 
+    def get_input_embeddings(self):
+        """Required by PreTrainedModel/PEFT - delegate to LLM."""
+        return self.llm.get_input_embeddings()
+    
+    def set_input_embeddings(self, value):
+        """Required by PreTrainedModel/PEFT - delegate to LLM."""
+        self.llm.set_input_embeddings(value)
+
     def forward(
         self,
         input_ids=None,
