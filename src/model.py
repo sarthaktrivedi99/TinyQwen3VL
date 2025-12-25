@@ -176,17 +176,22 @@ class NanoQwenVL(PreTrainedModel):
                 txt_emb = inputs_embeds[i]  # [Seq, Dim]
                 img_emb = image_embeds[i]    # [num_patches, Dim]
                 
-                # Ensure 2D tensors for concatenation
+                # Ensure 2D tensors for concatenation [Seq, Dim]
+                if txt_emb.dim() == 1:
+                    txt_emb = txt_emb.unsqueeze(0)  # [1, Dim]
                 if img_emb.dim() == 1:
-                    img_emb = img_emb.unsqueeze(0)  # [1, Dim] - single token
+                    img_emb = img_emb.unsqueeze(0)  # [1, Dim]
                 
-                # Concatenate [Image, Text]
+                # Concatenate [Image, Text] along sequence dimension
                 combined_emb = torch.cat([img_emb, txt_emb], dim=0)
                 new_inputs_embeds.append(combined_emb)
                 
                 # Handle Attention Mask
                 if attention_mask is not None:
                     cur_mask = attention_mask[i]
+                    # Ensure 1D mask
+                    if cur_mask.dim() == 0:
+                        cur_mask = cur_mask.unsqueeze(0)
                     # Create mask for image (ones)
                     img_mask = torch.ones(img_emb.shape[0], device=cur_mask.device, dtype=cur_mask.dtype)
                     combined_mask = torch.cat([img_mask, cur_mask], dim=0)
@@ -239,26 +244,39 @@ class NanoQwenVL(PreTrainedModel):
         attention_mask=None,
         **kwargs
     ):
-        # Re-implement simple logic for generation
+        # Get text embeddings
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
         if pixel_values is not None:
-            # PE-Core forward: [batch, num_tokens, vision_dim]
-            vision_outputs = self.vision_tower(pixel_values)
-            image_embeds = self.projector(vision_outputs)  # [B, 576, LLM_Dim]
+            # Use forward_features for patch embeddings
+            vision_outputs = self.vision_tower.forward_features(pixel_values)
+            
+            # Ensure 3D tensor [B, num_patches, dim]
+            if vision_outputs.dim() == 2:
+                vision_outputs = vision_outputs.unsqueeze(0)
+            
+            image_embeds = self.projector(vision_outputs)
             
             new_inputs_embeds = []
             new_attention_mask = []
             
             for i in range(len(inputs_embeds)):
-                img_emb = image_embeds[i]  # [576, Dim]
+                img_emb = image_embeds[i]
                 txt_emb = inputs_embeds[i]
+                
+                # Ensure 2D tensors [Seq, Dim]
+                if txt_emb.dim() == 1:
+                    txt_emb = txt_emb.unsqueeze(0)
+                if img_emb.dim() == 1:
+                    img_emb = img_emb.unsqueeze(0)
                 
                 combined_emb = torch.cat([img_emb, txt_emb], dim=0)
                 new_inputs_embeds.append(combined_emb)
                 
                 if attention_mask is not None:
                     cur_mask = attention_mask[i]
+                    if cur_mask.dim() == 0:
+                        cur_mask = cur_mask.unsqueeze(0)
                     img_mask = torch.ones(img_emb.shape[0], device=cur_mask.device, dtype=cur_mask.dtype)
                     new_attention_mask.append(torch.cat([img_mask, cur_mask], dim=0))
 
