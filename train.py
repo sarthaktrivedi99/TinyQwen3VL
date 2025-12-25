@@ -122,15 +122,17 @@ def train():
             lora_alpha=args.lora_alpha, 
             lora_dropout=args.lora_dropout,
             target_modules=target_modules,
-            
-            # CRITICAL: The projector is new/random and MUST be trained.
-            # "modules_to_save" ensures these layers remain trainable and are saved 
-            # in the adapter checkpoint, not ignored.
-            modules_to_save=["projector"] 
+            # NOTE: modules_to_save removed due to DeepSpeed ZeRO compatibility issues
         )
         
-        # This wraps the model. Base LLM weights -> Frozen. LoRA + Projector -> Trainable.
+        # This wraps the model. Base LLM weights -> Frozen. LoRA adapters -> Trainable.
         model = get_peft_model(model, peft_config)
+        
+        # Manually ensure projector is trainable (DeepSpeed compatible approach)
+        # The projector is new/random and MUST be trained
+        for param in model.base_model.model.projector.parameters():
+            param.requires_grad = True
+        
         model.print_trainable_parameters()
     else:
         print("Training without LoRA (full fine-tuning)...")
