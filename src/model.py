@@ -93,6 +93,10 @@ class NanoQwenVL(PreTrainedModel):
         if config.freeze_llm:
             self.llm.requires_grad_(False)
 
+        # Enable gradient checkpointing for memory efficiency
+        self.llm.gradient_checkpointing_enable()
+        self.vision_tower.set_grad_checkpointing(enable=True)
+
         # Dimensions
         # PE-Core small outputs 384-dim embeddings
         self.vision_dim = 384
@@ -100,6 +104,7 @@ class NanoQwenVL(PreTrainedModel):
         
         # Projector
         self.projector = nn.Sequential(
+            nn.LayerNorm(self.vision_dim),
             nn.Linear(self.vision_dim, self.llm_dim),
             nn.GELU(),
             nn.Linear(self.llm_dim, self.llm_dim)
