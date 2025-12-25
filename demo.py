@@ -19,8 +19,8 @@ def load_model(lora_path=None):
     print("Loading base model...")
     
     config = NanoQwenVLConfig(
-        llm_model_id="Qwen/Qwen3-0.6B",
-        vision_model_id="vit_pe_core_small_patch16_384.fb",
+        llm_model_id="google/gemma-3-270m-it",
+        vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
         freeze_vision=True,
         freeze_llm=True
     )
@@ -45,7 +45,7 @@ def load_model(lora_path=None):
 
 def create_image_transform():
     """Create image transform for PE-Core."""
-    temp_model = timm.create_model("vit_pe_core_small_patch16_384.fb", pretrained=False)
+    temp_model = timm.create_model("naflexvit_base_patch16_siglip.v2_webli", pretrained=False)
     data_config = resolve_model_data_config(temp_model)
     mean = data_config.get('mean', (0.5, 0.5, 0.5))
     std = data_config.get('std', (0.5, 0.5, 0.5))
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     MODEL, DEVICE = load_model(lora_path=args.lora_path)
-    TOKENIZER = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+    TOKENIZER = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
     IMAGE_TRANSFORM = create_image_transform()
     
     # Create and launch demo

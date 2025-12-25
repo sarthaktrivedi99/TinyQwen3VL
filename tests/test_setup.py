@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.model import NanoQwenVL, NanoQwenVLConfig
-from src.data import NanoVLMDataset, collate_fn
+from src.data import VQAIterableDataset, ImageProcessor, collate_fn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from datasets import load_dataset
@@ -14,8 +14,8 @@ import traceback
 def test_integration():
     print(">>> Testing Model Initialization...")
     config = NanoQwenVLConfig(
-        llm_model_id="Qwen/Qwen3-0.6B",
-        vision_model_id="vit_pe_core_small_patch16_384.fb",
+        llm_model_id="google/gemma-3-270m-it",
+        vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
     )
     model = NanoQwenVL(config)
     print("Model initialized successfully.")
@@ -24,7 +24,7 @@ def test_integration():
     # Test with dummy data instead of real dataset to avoid long downloads
     try:
         print("Initializing tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
         
         # Ensure pad token exists
         if tokenizer.pad_token is None:
@@ -40,10 +40,12 @@ def test_integration():
         print("Loading streaming dataset (will only fetch 1 sample)...")
         hf_dataset = load_dataset("HuggingFaceM4/FineVision", "CoSyn_400k_document", split="train", streaming=True)
         
-        # Initialize NanoVLMDataset with the new API
-        ds = NanoVLMDataset(
+        # Initialize dataset with new API
+        image_processor = ImageProcessor()
+        ds = VQAIterableDataset(
             dataset=hf_dataset,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            image_processor=image_processor
         )
         
         # Get one batch
@@ -62,7 +64,7 @@ def test_integration():
         # Use dummy data if dataset fails
         print("\nUsing dummy data for model forward test...")
         dummy_input_ids = torch.randint(0, 1000, (1, 10))
-        # PE-Core uses standard images [B, C, H, W]
+        # NaFlexViT uses standard images [B, C, H, W]
         dummy_pixel_values = torch.randn(1, 3, 384, 384)
         
         outputs = model(input_ids=dummy_input_ids, pixel_values=dummy_pixel_values)

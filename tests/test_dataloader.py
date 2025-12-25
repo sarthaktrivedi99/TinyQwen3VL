@@ -16,7 +16,7 @@ from src.data import NanoVLMDataset, collate_fn
 def test_dataloader_manual_verification():
     print(">>> 1. Initializing Tokenizer...")
     
-    tokenizer_id = "Qwen/Qwen3-0.6B" 
+    tokenizer_id = "google/gemma-3-270m-it" 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
     
     # Ensure pad token exists
@@ -145,10 +145,10 @@ def test_dataloader_manual_verification():
     if image_grid_hws is not None:
         print(f"  ✅ Image grid HWs provided (MoonViT native resolution)")
 
-# PE-Core Configuration
+# NaFlexViT Configuration
 VISION_CONFIG = {
-    "model_id": "vit_pe_core_small_patch16_384.fb",
-    "vision_dim": 384,  # PE-Core small embedding dimension
+    "model_id": "naflexvit_base_patch16_siglip.v2_webli",
+    "vision_dim": 768,  # NaFlexViT Base embedding dimension
 }
 
 if __name__ == "__main__":
