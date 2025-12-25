@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 precision (recommended for A100/H100)")
     parser.add_argument("--fp16", action="store_true", default=True, help="Use float16 precision (default: True)")
     parser.add_argument("--no_fp16", action="store_true", help="Disable fp16, use fp32")
+    parser.add_argument("--flash_attention", action="store_true", help="Use Flash Attention 2 (requires flash-attn package)")
     
     # Training arguments
     parser.add_argument("--output_dir", type=str, default="./nano_qwen_vl_checkpoints", help="Output directory")
@@ -91,7 +92,8 @@ def train():
         llm_model_id=llm_model_id,
         vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
         freeze_vision=True, 
-        freeze_llm=False
+        freeze_llm=False,
+        use_flash_attention=args.flash_attention
     )
     
     model = NanoQwenVL(config)

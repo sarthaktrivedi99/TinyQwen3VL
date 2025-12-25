@@ -22,6 +22,7 @@ class NanoQwenVLConfig(PretrainedConfig):
         vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
         freeze_vision=True,
         freeze_llm=False,
+        use_flash_attention=False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -29,6 +30,7 @@ class NanoQwenVLConfig(PretrainedConfig):
         self.vision_model_id = vision_model_id
         self.freeze_vision = freeze_vision
         self.freeze_llm = freeze_llm
+        self.use_flash_attention = use_flash_attention
 
 # -----------------------------------------------------------------------------
 # 2. Processor (Using TIMM for PE-Core)
@@ -90,9 +92,16 @@ class NanoQwenVL(PreTrainedModel):
         
         # Load LLM
         print(f"Loading LLM: {config.llm_model_id}...")
+        llm_kwargs = {
+            "trust_remote_code": True,
+        }
+        if config.use_flash_attention:
+            llm_kwargs["attn_implementation"] = "flash_attention_2"
+            print("  -> Using Flash Attention 2")
+        
         self.llm = AutoModelForCausalLM.from_pretrained(
             config.llm_model_id, 
-            trust_remote_code=True
+            **llm_kwargs
         )
         
         # Load NaFlexViT from TIMM
