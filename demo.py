@@ -30,8 +30,19 @@ def load_model(lora_path=None):
     if lora_path:
         print(f"Loading LoRA adapter from {lora_path}...")
         model = PeftModel.from_pretrained(model, lora_path)
-        model = model.merge_and_unload()  # Optionally merge for faster inference
+        model = model.merge_and_unload()  # Merge for faster inference
         print("LoRA adapter loaded and merged.")
+        
+        # Also load projector weights (saved separately)
+        import os
+        projector_path = os.path.join(lora_path, "projector.pt")
+        if os.path.exists(projector_path):
+            print(f"Loading projector from {projector_path}...")
+            projector_state = torch.load(projector_path, map_location="cpu")
+            model.projector.load_state_dict(projector_state)
+            print("Projector loaded successfully.")
+        else:
+            print(f"Warning: No projector.pt found at {projector_path}. Projector is still randomly initialized!")
     
     model.eval()
     

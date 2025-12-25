@@ -217,15 +217,18 @@ class BaseDataset(Dataset):
             add_special_tokens=False,
             return_dict=True,
         )
-        input_ids = conv_result["input_ids"]
+        input_ids = list(conv_result["input_ids"])
+        
+        # Add EOS token at the end if not already present
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is not None and (len(input_ids) == 0 or input_ids[-1] != eos_token_id):
+            input_ids.append(eos_token_id)
+        
         mask = [0] * len(input_ids)
         
         # For Gemma and similar models, we identify assistant tokens by:
         # 1. Finding the encoded assistant content in the full sequence
         # 2. Marking those positions as trainable
-        
-        # Get the full tokenized output as string for analysis
-        full_text = self.tokenizer.decode(input_ids)
         
         for msg in messages:
             if msg["role"] == "assistant":
@@ -240,11 +243,15 @@ class BaseDataset(Dataset):
                         if input_ids[i:i+content_len] == content_ids:
                             mask[i:i+content_len] = [1] * content_len
                             break
+        
+        # Also train on EOS token (important for generation to know when to stop)
+        if eos_token_id is not None and len(input_ids) > 0 and input_ids[-1] == eos_token_id:
+            mask[-1] = 1
 
         return (
             torch.tensor(input_ids),
             torch.tensor(mask).to(torch.bool),
-            torch.tensor(conv_result.get("attention_mask", [1] * len(input_ids)))
+            torch.tensor([1] * len(input_ids))  # All tokens are attended to
         )
 
 

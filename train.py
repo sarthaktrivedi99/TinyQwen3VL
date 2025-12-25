@@ -210,8 +210,15 @@ def train():
     print("Starting training...")
     trainer.train()
     
-    # 7. Save
+    # 7. Save final model
     trainer.save_model(f"{args.output_dir}/final")
+    
+    # CRITICAL: Also save projector weights separately (not saved by LoRA)
+    if use_lora:
+        projector_path = f"{args.output_dir}/final/projector.pt"
+        torch.save(model.base_model.model.projector.state_dict(), projector_path)
+        print(f"Projector saved to {projector_path}")
+    
     print("Training finished and model saved.")
 
 if __name__ == "__main__":
