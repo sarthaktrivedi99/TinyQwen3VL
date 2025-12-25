@@ -5,14 +5,14 @@ from transformers import Trainer, TrainingArguments, AutoTokenizer, TrainerCallb
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType
 from src.model import NanoQwenVL, NanoQwenVLConfig
-from src.data import NanoVLMDataset, collate_fn
+from src.data import VQAIterableDataset, ImageProcessor, collate_fn
 
 
 class ResolutionCurriculumCallback(TrainerCallback):
     """Callback to switch from low resolution to native resolution during training."""
     
-    def __init__(self, dataset, switch_step=2000):
-        self.dataset = dataset
+    def __init__(self, image_processor, switch_step=2000):
+        self.image_processor = image_processor
         self.switch_step = switch_step
         self.switched = False
     
@@ -21,7 +21,7 @@ class ResolutionCurriculumCallback(TrainerCallback):
             print(f"\n{'='*60}")
             print(f"[Resolution Curriculum] Step {state.global_step}: Switching to native resolution")
             print(f"{'='*60}\n")
-            self.dataset.set_max_resolution(None)  # Native resolution
+            self.image_processor.set_max_resolution(None)  # Native resolution
             self.switched = True
 
 def parse_args():
@@ -70,7 +70,7 @@ def train():
     # ------------------------------------------------------------------
     # 1. Tokenizer Setup (Must be done first to resize model)
     # ------------------------------------------------------------------
-    llm_model_id = "Qwen/Qwen3-0.6B" # Kept exactly as requested
+    llm_model_id = "google/gemma-3-270m-it"
     print(f"Loading tokenizer: {llm_model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(llm_model_id, trust_remote_code=True)
     
@@ -89,9 +89,9 @@ def train():
     print("Initialize Model...")
     config = NanoQwenVLConfig(
         llm_model_id=llm_model_id,
-        vision_model_id="vit_pe_core_small_patch16_384.fb",
+        vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
         freeze_vision=True, 
-        freeze_llm=False # We let PEFT handle the freezing
+        freeze_llm=False
     )
     
     model = NanoQwenVL(config)
@@ -106,7 +106,7 @@ def train():
     if use_lora:
         print(f"Applying LoRA (r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout})...")
         
-        # LLM target modules (standard Qwen)
+        # LLM target modules (Gemma architecture)
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         
         # Add vision backbone modules if enabled (using regex to target vision_tower specifically)
@@ -149,17 +149,18 @@ def train():
     print("Initialize Dataset...")
     
     # Load the raw HF data first
-    # Using streaming to avoid massive RAM usage, or standard load if dataset is small
+    # Using streaming to avoid massive RAM usage
     raw_dataset = load_dataset("HuggingFaceM4/FineVision", "CoSyn_400k_document", split="train", streaming=True)
     
-    # Use the NanoVLMDataset wrapper (from previous steps)
-    # We must pass the tokenizer so it uses the correct <|image_pad|> ID
-    # Resolution curriculum: start with low resolution
+    # Create image processor with resolution curriculum
     initial_max_res = None if args.no_curriculum else args.low_res
-    train_dataset = NanoVLMDataset(
+    image_processor = ImageProcessor(max_resolution=initial_max_res)
+    
+    # Create dataset with new VQAIterableDataset
+    train_dataset = VQAIterableDataset(
         dataset=raw_dataset, 
         tokenizer=tokenizer,
-        max_resolution=initial_max_res
+        image_processor=image_processor,
     )
     
     # ------------------------------------------------------------------
@@ -194,7 +195,7 @@ def train():
     callbacks = []
     if not args.no_curriculum:
         print(f"Resolution curriculum: low res={args.low_res} -> native at step {args.res_switch_step}")
-        callbacks.append(ResolutionCurriculumCallback(train_dataset, switch_step=args.res_switch_step))
+        callbacks.append(ResolutionCurriculumCallback(image_processor, switch_step=args.res_switch_step))
     
     trainer = Trainer(
         model=model,

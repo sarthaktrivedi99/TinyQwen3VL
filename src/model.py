@@ -18,8 +18,8 @@ class NanoQwenVLConfig(PretrainedConfig):
     model_type = "nano_qwen_vl"
     def __init__(
         self,
-        llm_model_id="Qwen/Qwen3-0.6b",
-        vision_model_id="vit_pe_core_small_patch16_384.fb",
+        llm_model_id="google/gemma-3-270m-it",
+        vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
         freeze_vision=True,
         freeze_llm=False,
         **kwargs
@@ -95,7 +95,7 @@ class NanoQwenVL(PreTrainedModel):
             trust_remote_code=True
         )
         
-        # Load PE-Core from TIMM
+        # Load NaFlexViT from TIMM
         print(f"Loading Vision Model: {config.vision_model_id}...")
         self.vision_tower = timm.create_model(
             config.vision_model_id,
@@ -103,8 +103,9 @@ class NanoQwenVL(PreTrainedModel):
             use_naflex=True,  # Enable NaFlex for flexible resolution
             dynamic_img_size=True,  # Allow dynamic image sizes
             dynamic_img_pad=True,   # Enable dynamic padding
-            num_classes=0,  # Remove classification head, return features
-            global_pool=''  # Disable pooling to get patch-level features [B, num_patches, embed_dim]
+            num_classes=0,  # Remove classification head
+            # Note: Don't set global_pool='' as it causes weight loading issues with SigLIP models
+            # Instead, we'll use forward_features() to get patch embeddings
         )
 
         if config.freeze_vision:
@@ -117,9 +118,9 @@ class NanoQwenVL(PreTrainedModel):
         self.vision_tower.set_grad_checkpointing(enable=True)
 
         # Dimensions
-        # PE-Core small outputs 384-dim embeddings
-        self.vision_dim = 384
-        self.llm_dim = self.llm.config.hidden_size
+        # NaFlexViT Base outputs 768-dim embeddings
+        self.vision_dim = 768
+        self.llm_dim = self.llm.config.hidden_size  # Gemma 270M: 1024
         
         # Projector (using proper Module class for DeepSpeed compatibility)
         self.projector = VisionProjector(self.vision_dim, self.llm_dim)
@@ -144,12 +145,16 @@ class NanoQwenVL(PreTrainedModel):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
         if pixel_values is not None:
-            # 1. Forward Vision Tower
-            # PE-Core outputs: [batch, num_tokens, vision_dim] e.g., [B, 576, 768]
-            vision_outputs = self.vision_tower(pixel_values)
+            # 1. Forward Vision Tower using forward_features to get patch embeddings
+            # NaFlexViT outputs: [batch, num_tokens, vision_dim] e.g., [B, num_patches, 768]
+            vision_outputs = self.vision_tower.forward_features(pixel_values)
+            
+            # Ensure 3D tensor [B, num_patches, dim] - some models may return 2D
+            if vision_outputs.dim() == 2:
+                vision_outputs = vision_outputs.unsqueeze(0)  # Add batch dim if missing
             
             # 2. Project to LLM dimension [batch, num_tokens, llm_dim]
-            image_embeds = self.projector(vision_outputs)  # [B, 576, LLM_Dim]
+            image_embeds = self.projector(vision_outputs)  # [B, num_patches, LLM_Dim]
             
             # 3. Merge into LLM sequence
             # Prepend image embeddings to text for each item in batch
@@ -160,7 +165,11 @@ class NanoQwenVL(PreTrainedModel):
             for i in range(len(inputs_embeds)):
                 # Get components for this batch item
                 txt_emb = inputs_embeds[i]  # [Seq, Dim]
-                img_emb = image_embeds[i]    # [576, Dim]
+                img_emb = image_embeds[i]    # [num_patches, Dim]
+                
+                # Ensure 2D tensors for concatenation
+                if img_emb.dim() == 1:
+                    img_emb = img_emb.unsqueeze(0)  # [1, Dim] - single token
                 
                 # Concatenate [Image, Text]
                 combined_emb = torch.cat([img_emb, txt_emb], dim=0)

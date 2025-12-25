@@ -10,16 +10,16 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-def test_pecore_variable_tokens():
-    """Test that PE-Core with NaFlex produces different token counts for different image sizes."""
+def test_naflex_variable_tokens():
+    """Test that NaFlexViT SigLIP produces different token counts for different image sizes."""
     
     print("=" * 60)
-    print("Testing PE-Core NaFlex Variable Token Count")
+    print("Testing NaFlexViT SigLIP Variable Token Count")
     print("=" * 60)
     
-    # Load PE-Core model with NaFlex
-    model_id = "vit_pe_core_small_patch16_384.fb"
-    print(f"\n>>> Loading {model_id} with NaFlex...")
+    # Load NaFlexViT model with NaFlex
+    model_id = "naflexvit_base_patch16_siglip.v2_webli"
+    print(f"\n>>> Loading {model_id}...")
     
     model = timm.create_model(
         model_id,
@@ -27,8 +27,8 @@ def test_pecore_variable_tokens():
         use_naflex=True,
         dynamic_img_size=True, 
         dynamic_img_pad=True,
-        num_classes=0,
-        global_pool=''
+        # Note: Don't set num_classes=0 or global_pool='' for SigLIP models
+        # as they cause weight loading issues. Use forward_features() instead.
     )
     model.eval()
     
@@ -72,10 +72,12 @@ def test_pecore_variable_tokens():
             # Transform and add batch dimension
             img_tensor = dynamic_transform(img).unsqueeze(0)
             
-            # Forward through model
-            features = model(img_tensor)
+            # Forward through model using forward_features for patch embeddings
+            features = model.forward_features(img_tensor)
             
             # Get token count (should be [1, num_tokens, embedding_dim])
+            if features.dim() == 2:
+                features = features.unsqueeze(0)
             batch_size, num_tokens, embed_dim = features.shape
             token_counts.append(num_tokens)
             
@@ -102,5 +104,5 @@ def test_pecore_variable_tokens():
         return False
 
 if __name__ == "__main__":
-    success = test_pecore_variable_tokens()
+    success = test_naflex_variable_tokens()
     exit(0 if success else 1)

@@ -1,58 +1,53 @@
+"""
+Dataset implementation for TinyQwen3VL - Vision Language Model training.
+Supports both indexed and iterable datasets with quality filtering.
+"""
 import torch
-from torch.utils.data import IterableDataset
-from transformers import AutoTokenizer
+import logging
 from PIL import Image
-import numpy as np
+from torch.utils.data import Dataset, IterableDataset
 import timm
-from timm.data import resolve_model_data_config, create_transform
+from timm.data import resolve_model_data_config
+from torchvision import transforms
 
 # ---------------------------------------------------------
-# Configuration
+# Vision Model Configuration (NaFlexViT Base SigLIP)
 # ---------------------------------------------------------
 VISION_CONFIG = {
-    "model_id": "vit_pe_core_small_patch16_384.fb",
-    "vision_dim": 384,  # PE-Core small embedding dimension
+    "model_id": "naflexvit_base_patch16_siglip.v2_webli",
+    "vision_dim": 768,  # NaFlexViT Base embedding dimension
 }
 
-class NanoVLMDataset(IterableDataset):
-    def __init__(self, dataset, tokenizer, vision_config=VISION_CONFIG, max_resolution=None):
-        """
-        Args:
-            max_resolution: Optional int for max height/width.
-                           If set, images are resized to fit within this resolution.
-                           Use None for native resolution (no resizing).
-        """
-        self.dataset = dataset
-        self.tokenizer = tokenizer
+
+def get_image_string(tokenizer, splitted_image_counts, mp_image_token_length):
+    """Generate image token string for the given image counts."""
+    image_tokens = []
+    for count in splitted_image_counts:
+        h, w = count if isinstance(count, (list, tuple)) else (count, count)
+        num_tokens = h * w * mp_image_token_length
+        image_tokens.append(tokenizer.image_token * num_tokens)
+    return "".join(image_tokens)
+
+
+class ImageProcessor:
+    """Image processor for NaFlexViT with dynamic resolution."""
+    
+    def __init__(self, vision_config=VISION_CONFIG, max_resolution=None):
         self.vision_config = vision_config
-        self.max_resolution = max_resolution  # For curriculum learning
+        self.max_resolution = max_resolution
         
-        # Load PE-Core transforms from TIMM
-        print(f"Loading Image Processor for {vision_config['model_id']}...")
-        
-        # Get normalization stats for PE-Core
+        # Get normalization stats from TIMM
         temp_model = timm.create_model(vision_config['model_id'], pretrained=False)
         data_config = resolve_model_data_config(temp_model)
         self.mean = data_config.get('mean', (0.5, 0.5, 0.5))
         self.std = data_config.get('std', (0.5, 0.5, 0.5))
         
-        # Import torchvision transforms
-        from torchvision import transforms
         self.to_tensor = transforms.ToTensor()
         self.normalize = transforms.Normalize(mean=self.mean, std=self.std)
-        
-        # Setup Special Token
-        if "<|image_pad|>" not in tokenizer.get_vocab():
-            self.img_token_id = tokenizer.unk_token_id
-            self.img_token_str = tokenizer.unk_token
-            print(f"[DEBUG] <|image_pad|> not found, using unk_token: {self.img_token_str} ({self.img_token_id})")
-        else:
-            self.img_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
-            self.img_token_str = "<|image_pad|>"
-            print(f"[DEBUG] Using <|image_pad|>: {self.img_token_str} ({self.img_token_id})")
+        self.patch_size = 16
         
         if max_resolution:
-            print(f"[Resolution Curriculum] Starting with max resolution: {max_resolution}")
+            print(f"[ImageProcessor] Max resolution: {max_resolution}")
     
     def set_max_resolution(self, max_resolution):
         """Update max resolution for curriculum learning."""
@@ -70,7 +65,6 @@ class NanoVLMDataset(IterableDataset):
         max_size = self.max_resolution
         w, h = img.size
         
-        # Only resize if image is larger than max
         if h > max_size or w > max_size:
             scale = min(max_size / h, max_size / w)
             new_w = int(w * scale)
@@ -79,11 +73,11 @@ class NanoVLMDataset(IterableDataset):
         
         return img
     
-    def _pad_to_patch_size(self, img, patch_size=16):
+    def _pad_to_patch_size(self, img):
         """Pad image to make dimensions divisible by patch_size."""
         w, h = img.size
-        new_w = ((w + patch_size - 1) // patch_size) * patch_size
-        new_h = ((h + patch_size - 1) // patch_size) * patch_size
+        new_w = ((w + self.patch_size - 1) // self.patch_size) * self.patch_size
+        new_h = ((h + self.patch_size - 1) // self.patch_size) * self.patch_size
         
         if new_w != w or new_h != h:
             padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
@@ -91,187 +85,326 @@ class NanoVLMDataset(IterableDataset):
             return padded
         return img
     
-    def image_transform(self, img):
-        """Apply transforms: resize (if curriculum) -> pad -> tensor -> normalize."""
+    def __call__(self, img):
+        """Process image and return tensor with grid size info."""
         img = self._resize_if_needed(img)
-        img = self._pad_to_patch_size(img, patch_size=16)
+        img = self._pad_to_patch_size(img)
+        
+        w, h = img.size
+        grid_h = h // self.patch_size
+        grid_w = w // self.patch_size
+        
         tensor = self.to_tensor(img)
         tensor = self.normalize(tensor)
-        return tensor 
+        
+        return tensor, (grid_h, grid_w)
 
-    def process_item(self, item):
-        """
-        Processes a single item from HuggingFaceM4/FineVision (CoSyn_400k_document).
-        Format:
-        {
-            "images": [PIL.Image, ...],
-            "texts": [{"user": "...", "assistant": "..."}, ...],
-            ...
-        }
-        """
-        try:
-            # --- A. Image Handling ---
-            # FineVision uses 'images' list
-            images = item.get('images')
-            if not images or len(images) == 0:
-                return None
-            
-            image = images[0]
-            
-            # Ensure PIL Image
-            if not isinstance(image, Image.Image):
-                if isinstance(image, str):
-                    try:
-                        image = Image.open(image).convert('RGB')
-                    except Exception as e:
-                        return None
-                else:
-                    return None
+
+class BaseDataset(Dataset):
+    """Base dataset class with quality filtering and chat template support."""
+    
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        image_processor,
+        mp_image_token_length=1,
+        relevance_min_rating=1,
+        image_correspondence_min_rating=1,
+        visual_dependency_min_rating=1,
+        formatting_min_rating=1
+    ):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.mp_image_token_length = mp_image_token_length
+        self.relevance_min_rating = relevance_min_rating
+        self.image_correspondence_min_rating = image_correspondence_min_rating
+        self.visual_dependency_min_rating = visual_dependency_min_rating
+        self.formatting_min_rating = formatting_min_rating
+        
+        # Set up image token if not present
+        if not hasattr(tokenizer, 'image_token'):
+            if "<|image_pad|>" in tokenizer.get_vocab():
+                self.tokenizer.image_token = "<|image_pad|>"
             else:
-                image = image.convert('RGB')
-            
-            # Process image with TIMM transform
-            pixel_values = self.image_transform(image)  # Returns [C, H, W]
+                tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+                self.tokenizer.image_token = "<|image_pad|>"
+        
+        self.prefix_len = self._get_prefix_len()
 
-            # --- B. Text Handling ---
-            # FineVision uses 'texts' list of dicts: [{'user': '...', 'assistant': '...'}]
-            texts = item.get('texts')
-            if not texts or len(texts) == 0:
-                return None
-                
-            # Construct conversation from all text turns
-            conversations = []
-            if isinstance(texts, list):
-                for t in texts:
-                    if isinstance(t, dict):
-                        if 'user' in t and 'assistant' in t:
-                            conversations.append({"from": "human", "value": t['user']})
-                            conversations.append({"from": "gpt", "value": t['assistant']})
-            
-            if not conversations:
-                return None
-            
-            # --- C. Tokenization & Masking ---
-            # For MoonViT, we don't inject image placeholders into text
-            # Instead, image embeddings are prepended in the model's forward pass
-            # So we just tokenize the conversation normally
-            
-            # ChatML delimiters
-            im_start = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-            im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-            
-            # Tokenize newline (may be multiple tokens)
-            nl_ids = self.tokenizer("\n", add_special_tokens=False).input_ids
-            
-            # Pre-tokenized role headers
-            user_header = [im_start] + self.tokenizer("user", add_special_tokens=False).input_ids + nl_ids
-            assistant_header = [im_start] + self.tokenizer("assistant", add_special_tokens=False).input_ids + nl_ids
-            
-            input_ids = []
-            labels = []
-            
-            # Iterate through turns (user -> assistant -> user -> assistant)
-            # We assume the list is ordered: human, gpt, human, gpt...
-            for idx, msg in enumerate(conversations):
-                role = msg.get('from', '').lower()
-                content = msg.get('value', '').strip()
-                
-                if role in ['human', 'user']:
-                    content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
-                    # User turn: Mask everything
-                    turn_ids = user_header + content_ids + [im_end] + nl_ids
-                    turn_labels = [-100] * len(turn_ids)
-                    
-                    input_ids.extend(turn_ids)
-                    labels.extend(turn_labels)
-                    
-                elif role in ['gpt', 'assistant']:
-                    content_ids = self.tokenizer(content, add_special_tokens=False).input_ids
-                    
-                    # Assistant turn: Mask header, train on content
-                    header_len = len(assistant_header)
-                    turn_ids = assistant_header + content_ids + [im_end] + nl_ids
-                    
-                    turn_labels = (
-                        [-100] * header_len +
-                        content_ids +
-                        [im_end] + nl_ids
-                    )
-                    
-                    input_ids.extend(turn_ids)
-                    labels.extend(turn_labels)
+    def __len__(self):
+        return len(self.dataset)
 
-            # Truncate
-            max_len = 1024
-            if len(input_ids) > max_len:
-                input_ids = input_ids[:max_len]
-                labels = labels[:max_len]
-                
-            if len(input_ids) == 0:
-                return None
-                
-            return {
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "labels": torch.tensor(labels, dtype=torch.long),
-                "pixel_values": pixel_values,
-            }
+    def _get_prefix_len(self):
+        """Calculate the prefix length for loss masking."""
+        try:
+            random_string = "xzyvd"
+            random_string_templated = self.tokenizer.apply_chat_template(
+                [{"role": "assistant", "content": random_string}],
+                tokenize=False,
+                add_special_tokens=False
+            )
+            random_string_location = random_string_templated.find(random_string)
+            return len(self.tokenizer.encode(random_string_templated[:random_string_location]))
+        except Exception:
+            return 0
 
-        except Exception as e:
-            print(f"      [DEBUG] Exception in process_item: {e}")
-            import traceback
-            traceback.print_exc()
+    def _get_messages(self, item, splitted_image_counts):
+        """Extract and filter messages from item."""
+        messages = []
+        texts = item.get('texts', [])
+        
+        for index, text in enumerate(texts):
+            # Quality filtering
+            try:
+                if item.get('relevance_ratings') and item['relevance_ratings'][index] is not None:
+                    if item['relevance_ratings'][index] < self.relevance_min_rating:
+                        continue
+                if item.get('image_correspondence_ratings') and item['image_correspondence_ratings'][index] is not None:
+                    if item['image_correspondence_ratings'][index] < self.image_correspondence_min_rating:
+                        continue
+                if item.get('visual_dependency_ratings') and item['visual_dependency_ratings'][index] is not None:
+                    if item['visual_dependency_ratings'][index] < self.visual_dependency_min_rating:
+                        continue
+                if item.get('formatting_ratings') and item['formatting_ratings'][index] is not None:
+                    if item['formatting_ratings'][index] < self.formatting_min_rating:
+                        continue
+            except Exception as e:
+                logging.warning(f"Error processing item ratings: {e}")
+
+            if isinstance(text, dict):
+                messages.append({"role": "user", "content": text.get('user', '')})
+                messages.append({"role": "assistant", "content": text.get('assistant', '')})
+
+        if len(messages) == 0:
+            return messages
+
+        # Safety: remove any existing image tokens
+        for msg in messages:
+            if self.tokenizer.image_token in msg["content"]:
+                msg["content"] = msg["content"].replace(self.tokenizer.image_token, "")
+
+        # Prepend image tokens to first message
+        if len(splitted_image_counts) > 0:
+            image_string = get_image_string(self.tokenizer, splitted_image_counts, self.mp_image_token_length)
+            messages[0]["content"] = image_string + messages[0]["content"]
+
+        return messages
+
+    def _process_images(self, images):
+        """Process list of PIL images."""
+        processed_images = []
+        splitted_image_counts = []
+        
+        for image in images:
+            if isinstance(image, Image.Image):
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                processed_image, grid_size = self.image_processor(image)
+                processed_images.append(processed_image)
+                splitted_image_counts.append(grid_size)
+            else:
+                logging.warning(f"Skipping non-PIL image: {type(image)}")
+        
+        return processed_images, splitted_image_counts
+
+    def _prepare_inputs_and_loss_mask(self, messages):
+        """Prepare input_ids and loss mask using chat template."""
+        conv_result = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_special_tokens=False,
+            return_dict=True,
+        )
+        input_ids = conv_result["input_ids"]
+        mask = [0] * len(input_ids)
+        
+        # For Gemma and similar models, we identify assistant tokens by:
+        # 1. Finding the encoded assistant content in the full sequence
+        # 2. Marking those positions as trainable
+        
+        # Get the full tokenized output as string for analysis
+        full_text = self.tokenizer.decode(input_ids)
+        
+        for msg in messages:
+            if msg["role"] == "assistant":
+                content = msg["content"]
+                if content:
+                    # Encode just the content
+                    content_ids = self.tokenizer.encode(content, add_special_tokens=False)
+                    content_len = len(content_ids)
+                    
+                    # Search for this content in the full sequence
+                    for i in range(len(input_ids) - content_len + 1):
+                        if input_ids[i:i+content_len] == content_ids:
+                            mask[i:i+content_len] = [1] * content_len
+                            break
+
+        return (
+            torch.tensor(input_ids),
+            torch.tensor(mask).to(torch.bool),
+            torch.tensor(conv_result.get("attention_mask", [1] * len(input_ids)))
+        )
+
+
+class VQADataset(BaseDataset):
+    """Visual Question Answering Dataset with indexed access."""
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        return self._process_data(item)
+
+    def _process_data(self, item):
+        """Process a single data item."""
+        # Handle images
+        images_data = item.get('images')
+        if images_data is None:
+            images_data = []
+        elif not isinstance(images_data, list):
+            images_data = [images_data]
+
+        processed_images = []
+        splitted_image_counts = []
+        if images_data:
+            processed_images, splitted_image_counts = self._process_images(images_data)
+
+        messages = self._get_messages(item, splitted_image_counts)
+
+        if len(messages) == 0:
             return None
 
-    def __iter__(self):
-        """
-        Yields items one by one from the stream.
-        """
-        for item in self.dataset:
-            processed = self.process_item(item)
-            if processed is not None:
-                yield processed
+        input_ids, mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
+        labels = self._get_labels(input_ids, mask)
 
-# ---------------------------------------------------------
-# Data Collator (Handles variable-length image tokens)
-# ---------------------------------------------------------
+        # Stack images if present
+        if processed_images:
+            pixel_values = torch.stack(processed_images) if len(processed_images) > 1 else processed_images[0].unsqueeze(0)
+        else:
+            pixel_values = None
+
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    def _get_labels(self, input_ids, mask):
+        """Create labels with -100 for non-assistant tokens (causal LM style)."""
+        labels = input_ids.clone().masked_fill(~mask, -100)
+        labels = labels.roll(-1)  # Shift labels for causal LM
+        labels[-1] = -100  # Last token has no target
+        return labels
+
+
+class VQAIterableDataset(IterableDataset, BaseDataset):
+    """Iterable version of VQADataset for streaming large datasets."""
+    
+    def __init__(self, *args, **kwargs):
+        BaseDataset.__init__(self, *args, **kwargs)
+    
+    def __iter__(self):
+        for item in self.dataset:
+            result = self._process_data(item)
+            if result is not None:
+                yield result
+    
+    def _process_data(self, item):
+        """Process a single data item (same as VQADataset)."""
+        images_data = item.get('images')
+        if images_data is None:
+            images_data = []
+        elif not isinstance(images_data, list):
+            images_data = [images_data]
+
+        processed_images = []
+        splitted_image_counts = []
+        if images_data:
+            processed_images, splitted_image_counts = self._process_images(images_data)
+
+        messages = self._get_messages(item, splitted_image_counts)
+
+        if len(messages) == 0:
+            return None
+
+        input_ids, mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
+        labels = self._get_labels(input_ids, mask)
+
+        if processed_images:
+            pixel_values = torch.stack(processed_images) if len(processed_images) > 1 else processed_images[0].unsqueeze(0)
+        else:
+            pixel_values = None
+
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+    
+    def _get_labels(self, input_ids, mask):
+        labels = input_ids.clone().masked_fill(~mask, -100)
+        labels = labels.roll(-1)
+        labels[-1] = -100
+        return labels
+
+
 def collate_fn(batch):
-    # Filter out any Nones
+    """Collate function for DataLoader - handles variable-sized images."""
+    import torch.nn.functional as F
+    
+    # Filter Nones
     batch = [item for item in batch if item is not None]
     if len(batch) == 0:
         return {}
 
     # Handle variable-sized images (NaFlex produces different sizes)
-    # Pad to max dimensions in the batch
-    pixel_values_list = [item['pixel_values'] for item in batch]
+    pixel_values_list = [item['pixel_values'] for item in batch if item['pixel_values'] is not None]
     
-    # Get max height and width in batch
-    max_h = max(pv.shape[1] for pv in pixel_values_list)
-    max_w = max(pv.shape[2] for pv in pixel_values_list)
-    
-    # Pad each image to max dimensions
-    import torch.nn.functional as F
-    padded_pixel_values = []
-    for pv in pixel_values_list:
-        c, h, w = pv.shape
-        # Pad: (left, right, top, bottom)
-        pad_h = max_h - h
-        pad_w = max_w - w
-        padded = F.pad(pv, (0, pad_w, 0, pad_h), value=0)  # [C, max_h, max_w]
-        padded_pixel_values.append(padded)
-    
-    # Now stack all padded images
-    pixel_values = torch.stack(padded_pixel_values)  # [B, C, max_h, max_w]
-    
-    # Pad input_ids and labels
+    if pixel_values_list:
+        # Squeeze any extra batch dims and get max dimensions
+        processed = []
+        for pv in pixel_values_list:
+            if pv.dim() == 4:  # [B, C, H, W]
+                pv = pv.squeeze(0)  # [C, H, W]
+            processed.append(pv)
+        
+        max_h = max(pv.shape[1] for pv in processed)
+        max_w = max(pv.shape[2] for pv in processed)
+        
+        # Pad each image to max dimensions
+        padded_pixel_values = []
+        for pv in processed:
+            c, h, w = pv.shape
+            pad_h, pad_w = max_h - h, max_w - w
+            padded = F.pad(pv, (0, pad_w, 0, pad_h), value=0)
+            padded_pixel_values.append(padded)
+        
+        pixel_values = torch.stack(padded_pixel_values)
+    else:
+        pixel_values = None
+
+    # Pad input_ids, attention_mask, and labels
     input_ids = [item['input_ids'] for item in batch]
+    attention_mask = [item['attention_mask'] for item in batch]
     labels = [item['labels'] for item in batch]
     
     padded_input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    padded_attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
     padded_labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
-    
-    return {
+
+    result = {
         "input_ids": padded_input_ids,
+        "attention_mask": padded_attention_mask,
         "labels": padded_labels,
-        "pixel_values": pixel_values,
-        "attention_mask": (padded_input_ids != 0).long()
     }
+    
+    if pixel_values is not None:
+        result["pixel_values"] = pixel_values
+    
+    return result
+
+
+# Backwards compatibility alias
+NanoVLMDataset = VQAIterableDataset
