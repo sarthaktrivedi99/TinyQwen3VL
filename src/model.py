@@ -60,7 +60,26 @@ class NanoQwenProcessor:
         return inputs
 
 # -----------------------------------------------------------------------------
-# 3. Model Definition
+# 3. Projector Module (DeepSpeed compatible)
+# -----------------------------------------------------------------------------
+class VisionProjector(nn.Module):
+    """Projects vision features to LLM dimension. Separate class for DeepSpeed compatibility."""
+    def __init__(self, vision_dim, llm_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(vision_dim)
+        self.fc1 = nn.Linear(vision_dim, llm_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(llm_dim, llm_dim)
+    
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+# -----------------------------------------------------------------------------
+# 4. Model Definition
 # -----------------------------------------------------------------------------
 class NanoQwenVL(PreTrainedModel):
     config_class = NanoQwenVLConfig
@@ -102,13 +121,8 @@ class NanoQwenVL(PreTrainedModel):
         self.vision_dim = 384
         self.llm_dim = self.llm.config.hidden_size
         
-        # Projector
-        self.projector = nn.Sequential(
-            nn.LayerNorm(self.vision_dim),
-            nn.Linear(self.vision_dim, self.llm_dim),
-            nn.GELU(),
-            nn.Linear(self.llm_dim, self.llm_dim)
-        )
+        # Projector (using proper Module class for DeepSpeed compatibility)
+        self.projector = VisionProjector(self.vision_dim, self.llm_dim)
 
     def get_input_embeddings(self):
         """Required by PreTrainedModel/PEFT - delegate to LLM."""
