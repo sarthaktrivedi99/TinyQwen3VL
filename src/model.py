@@ -82,6 +82,8 @@ class NanoQwenVL(PreTrainedModel):
             config.vision_model_id,
             pretrained=True,
             use_naflex=True,  # Enable NaFlex for flexible resolution
+            dynamic_img_size=True,  # Allow dynamic image sizes
+            dynamic_img_pad=True,   # Enable dynamic padding
             num_classes=0,  # Remove classification head, return features
             global_pool=''  # Disable pooling to get patch-level features [B, num_patches, embed_dim]
         )

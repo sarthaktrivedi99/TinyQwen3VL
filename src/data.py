@@ -22,9 +22,38 @@ class NanoVLMDataset(IterableDataset):
         
         # Load PE-Core transforms from TIMM
         print(f"Loading Image Processor for {vision_config['model_id']}...")
-        model = timm.create_model(vision_config['model_id'], pretrained=False)
-        data_config = resolve_model_data_config(model)
-        self.image_transform = create_transform(**data_config, is_training=False)
+        
+        # Get normalization stats for PE-Core
+        # Use a temporary model to get config, but use dynamic transforms
+        temp_model = timm.create_model(vision_config['model_id'], pretrained=False)
+        data_config = resolve_model_data_config(temp_model)
+        mean = data_config.get('mean', (0.5, 0.5, 0.5))
+        std = data_config.get('std', (0.5, 0.5, 0.5))
+        
+        # Import torchvision transforms for dynamic processing
+        from torchvision import transforms
+        
+        # Dynamic transform: only convert to tensor and normalize, NO fixed resizing
+        # NaFlex handles variable sizes directly
+        # However, dimensions must be divisible by patch_size (16 for this model)
+        self.image_transform = transforms.Compose([
+            transforms.Lambda(lambda img: self._pad_to_patch_size(img, patch_size=16)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+    
+    def _pad_to_patch_size(self, img, patch_size=16):
+        """Pad image to make dimensions divisible by patch_size."""
+        w, h = img.size
+        new_w = ((w + patch_size - 1) // patch_size) * patch_size
+        new_h = ((h + patch_size - 1) // patch_size) * patch_size
+        
+        if new_w != w or new_h != h:
+            from PIL import Image
+            padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
+            padded.paste(img, (0, 0))
+            return padded
+        return img
         
         # Setup Special Token
         if "<|image_pad|>" not in tokenizer.get_vocab():
@@ -177,9 +206,27 @@ def collate_fn(batch):
     if len(batch) == 0:
         return {}
 
-    # Stack pixel values (all same size with PE-Core)
-    # Each item has pixel_values of shape [C, H, W]
-    pixel_values = torch.stack([item['pixel_values'] for item in batch])  # [B, C, H, W]
+    # Handle variable-sized images (NaFlex produces different sizes)
+    # Pad to max dimensions in the batch
+    pixel_values_list = [item['pixel_values'] for item in batch]
+    
+    # Get max height and width in batch
+    max_h = max(pv.shape[1] for pv in pixel_values_list)
+    max_w = max(pv.shape[2] for pv in pixel_values_list)
+    
+    # Pad each image to max dimensions
+    import torch.nn.functional as F
+    padded_pixel_values = []
+    for pv in pixel_values_list:
+        c, h, w = pv.shape
+        # Pad: (left, right, top, bottom)
+        pad_h = max_h - h
+        pad_w = max_w - w
+        padded = F.pad(pv, (0, pad_w, 0, pad_h), value=0)  # [C, max_h, max_w]
+        padded_pixel_values.append(padded)
+    
+    # Now stack all padded images
+    pixel_values = torch.stack(padded_pixel_values)  # [B, C, max_h, max_w]
     
     # Pad input_ids and labels
     input_ids = [item['input_ids'] for item in batch]
