@@ -15,45 +15,31 @@ VISION_CONFIG = {
 }
 
 class NanoVLMDataset(IterableDataset):
-    def __init__(self, dataset, tokenizer, vision_config=VISION_CONFIG):
+    def __init__(self, dataset, tokenizer, vision_config=VISION_CONFIG, max_resolution=None):
+        """
+        Args:
+            max_resolution: Optional int for max height/width.
+                           If set, images are resized to fit within this resolution.
+                           Use None for native resolution (no resizing).
+        """
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.vision_config = vision_config
+        self.max_resolution = max_resolution  # For curriculum learning
         
         # Load PE-Core transforms from TIMM
         print(f"Loading Image Processor for {vision_config['model_id']}...")
         
         # Get normalization stats for PE-Core
-        # Use a temporary model to get config, but use dynamic transforms
         temp_model = timm.create_model(vision_config['model_id'], pretrained=False)
         data_config = resolve_model_data_config(temp_model)
-        mean = data_config.get('mean', (0.5, 0.5, 0.5))
-        std = data_config.get('std', (0.5, 0.5, 0.5))
+        self.mean = data_config.get('mean', (0.5, 0.5, 0.5))
+        self.std = data_config.get('std', (0.5, 0.5, 0.5))
         
-        # Import torchvision transforms for dynamic processing
+        # Import torchvision transforms
         from torchvision import transforms
-        
-        # Dynamic transform: only convert to tensor and normalize, NO fixed resizing
-        # NaFlex handles variable sizes directly
-        # However, dimensions must be divisible by patch_size (16 for this model)
-        self.image_transform = transforms.Compose([
-            transforms.Lambda(lambda img: self._pad_to_patch_size(img, patch_size=16)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
-        ])
-    
-    def _pad_to_patch_size(self, img, patch_size=16):
-        """Pad image to make dimensions divisible by patch_size."""
-        w, h = img.size
-        new_w = ((w + patch_size - 1) // patch_size) * patch_size
-        new_h = ((h + patch_size - 1) // patch_size) * patch_size
-        
-        if new_w != w or new_h != h:
-            from PIL import Image
-            padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
-            padded.paste(img, (0, 0))
-            return padded
-        return img
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=self.mean, std=self.std)
         
         # Setup Special Token
         if "<|image_pad|>" not in tokenizer.get_vocab():
@@ -63,7 +49,55 @@ class NanoVLMDataset(IterableDataset):
         else:
             self.img_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
             self.img_token_str = "<|image_pad|>"
-            print(f"[DEBUG] Using <|image_pad|>: {self.img_token_str} ({self.img_token_id})") 
+            print(f"[DEBUG] Using <|image_pad|>: {self.img_token_str} ({self.img_token_id})")
+        
+        if max_resolution:
+            print(f"[Resolution Curriculum] Starting with max resolution: {max_resolution}")
+    
+    def set_max_resolution(self, max_resolution):
+        """Update max resolution for curriculum learning."""
+        self.max_resolution = max_resolution
+        if max_resolution:
+            print(f"[Resolution Curriculum] Set max resolution to {max_resolution}")
+        else:
+            print("[Resolution Curriculum] Switched to native resolution")
+    
+    def _resize_if_needed(self, img):
+        """Resize image if max_resolution is set, preserving aspect ratio."""
+        if self.max_resolution is None:
+            return img
+        
+        max_size = self.max_resolution
+        w, h = img.size
+        
+        # Only resize if image is larger than max
+        if h > max_size or w > max_size:
+            scale = min(max_size / h, max_size / w)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        
+        return img
+    
+    def _pad_to_patch_size(self, img, patch_size=16):
+        """Pad image to make dimensions divisible by patch_size."""
+        w, h = img.size
+        new_w = ((w + patch_size - 1) // patch_size) * patch_size
+        new_h = ((h + patch_size - 1) // patch_size) * patch_size
+        
+        if new_w != w or new_h != h:
+            padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
+            padded.paste(img, (0, 0))
+            return padded
+        return img
+    
+    def image_transform(self, img):
+        """Apply transforms: resize (if curriculum) -> pad -> tensor -> normalize."""
+        img = self._resize_if_needed(img)
+        img = self._pad_to_patch_size(img, patch_size=16)
+        tensor = self.to_tensor(img)
+        tensor = self.normalize(tensor)
+        return tensor 
 
     def process_item(self, item):
         """

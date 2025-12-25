@@ -1,11 +1,28 @@
 import os
 import argparse
 import torch
-from transformers import Trainer, TrainingArguments, AutoTokenizer
+from transformers import Trainer, TrainingArguments, AutoTokenizer, TrainerCallback
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType
 from src.model import NanoQwenVL, NanoQwenVLConfig
 from src.data import NanoVLMDataset, collate_fn
+
+
+class ResolutionCurriculumCallback(TrainerCallback):
+    """Callback to switch from low resolution to native resolution during training."""
+    
+    def __init__(self, dataset, switch_step=2000):
+        self.dataset = dataset
+        self.switch_step = switch_step
+        self.switched = False
+    
+    def on_step_begin(self, args, state, control, **kwargs):
+        if not self.switched and state.global_step >= self.switch_step:
+            print(f"\n{'='*60}")
+            print(f"[Resolution Curriculum] Step {state.global_step}: Switching to native resolution")
+            print(f"{'='*60}\n")
+            self.dataset.set_max_resolution(None)  # Native resolution
+            self.switched = True
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NanoQwenVL model")
@@ -34,6 +51,11 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=10000, help="Max training steps (default: 10000)")
     parser.add_argument("--save_steps", type=int, default=50, help="Save checkpoint every N steps (default: 50)")
     parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps (default: 10)")
+    
+    # Resolution curriculum arguments
+    parser.add_argument("--low_res", type=int, default=448, help="Low resolution for curriculum (default: 448)")
+    parser.add_argument("--res_switch_step", type=int, default=2000, help="Step to switch to native resolution (default: 2000)")
+    parser.add_argument("--no_curriculum", action="store_true", help="Disable resolution curriculum")
     
     return parser.parse_args()
 
@@ -124,9 +146,12 @@ def train():
     
     # Use the NanoVLMDataset wrapper (from previous steps)
     # We must pass the tokenizer so it uses the correct <|image_pad|> ID
+    # Resolution curriculum: start with low resolution
+    initial_max_res = None if args.no_curriculum else args.low_res
     train_dataset = NanoVLMDataset(
         dataset=raw_dataset, 
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        max_resolution=initial_max_res
     )
     
     # ------------------------------------------------------------------
@@ -157,11 +182,18 @@ def train():
     # ------------------------------------------------------------------
     # 6. Trainer Execution
     # ------------------------------------------------------------------
+    # Resolution curriculum callback
+    callbacks = []
+    if not args.no_curriculum:
+        print(f"Resolution curriculum: low res={args.low_res} -> native at step {args.res_switch_step}")
+        callbacks.append(ResolutionCurriculumCallback(train_dataset, switch_step=args.res_switch_step))
+    
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=collate_fn
+        data_collator=collate_fn,
+        callbacks=callbacks
     )
     
     print("Starting training...")
