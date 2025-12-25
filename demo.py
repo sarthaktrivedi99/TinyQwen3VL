@@ -12,10 +12,22 @@ from timm.data import resolve_model_data_config
 from peft import PeftModel
 
 from src.model import NanoQwenVL, NanoQwenVLConfig
+from src.data import ImageProcessor
 
 
-def load_model(lora_path=None):
-    """Load the model (optionally with LoRA checkpoint)."""
+def _load_checkpoint(filepath):
+    """Load checkpoint from either safetensors or pytorch format."""
+    if filepath.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return load_file(filepath)
+    else:
+        return torch.load(filepath, map_location="cpu")
+
+
+def load_model(checkpoint_path=None, lora_path=None):
+    """Load the model (optionally with full checkpoint or LoRA adapter)."""
+    import os
+    
     print("Loading base model...")
     
     config = NanoQwenVLConfig(
@@ -27,52 +39,74 @@ def load_model(lora_path=None):
     
     model = NanoQwenVL(config)
     
-    if lora_path:
+    # Load tokenizer and resize embeddings to match checkpoint (with <|image_pad|> token added)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if "<|image_pad|>" not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+    model.llm.resize_token_embeddings(len(tokenizer))
+    
+    if checkpoint_path:
+        # Load full checkpoint (all weights)
+        print(f"Loading full checkpoint from {checkpoint_path}...")
+        if os.path.isdir(checkpoint_path):
+            # Directory with pytorch_model.bin or model.safetensors
+            import glob
+            ckpt_file = None
+            for pattern in ["model.safetensors", "pytorch_model.bin", "*.pt", "*.pth"]:
+                matches = glob.glob(os.path.join(checkpoint_path, pattern))
+                if matches:
+                    ckpt_file = matches[0]
+                    break
+            if ckpt_file:
+                state_dict = _load_checkpoint(ckpt_file)
+                model.load_state_dict(state_dict, strict=False)
+                print(f"Loaded checkpoint from {ckpt_file}")
+            else:
+                print(f"Warning: No checkpoint file found in {checkpoint_path}")
+        else:
+            # Single file
+            state_dict = _load_checkpoint(checkpoint_path)
+            model.load_state_dict(state_dict, strict=False)
+            print(f"Loaded checkpoint from {checkpoint_path}")
+    
+    elif lora_path:
+        # Load LoRA adapter
         print(f"Loading LoRA adapter from {lora_path}...")
         model = PeftModel.from_pretrained(model, lora_path)
-        model = model.merge_and_unload()  # Optionally merge for faster inference
+        model = model.merge_and_unload()  # Merge for faster inference
         print("LoRA adapter loaded and merged.")
+        
+        # Also load projector weights (saved separately)
+        projector_path = os.path.join(lora_path, "projector.pt")
+        if os.path.exists(projector_path):
+            print(f"Loading projector from {projector_path}...")
+            projector_state = torch.load(projector_path, map_location="cpu")
+            model.projector.load_state_dict(projector_state)
+            print("Projector loaded successfully.")
+        else:
+            print(f"Warning: No projector.pt found at {projector_path}. Projector is still randomly initialized!")
     
     model.eval()
     
     # Move to GPU if available
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model = model.to(device)
     print(f"Model loaded on {device}")
     
     return model, device
 
 
-def create_image_transform():
-    """Create image transform for PE-Core."""
-    temp_model = timm.create_model("naflexvit_base_patch16_siglip.v2_webli", pretrained=False)
-    data_config = resolve_model_data_config(temp_model)
-    mean = data_config.get('mean', (0.5, 0.5, 0.5))
-    std = data_config.get('std', (0.5, 0.5, 0.5))
-    
-    def pad_to_patch_size(img, patch_size=16):
-        w, h = img.size
-        new_w = ((w + patch_size - 1) // patch_size) * patch_size
-        new_h = ((h + patch_size - 1) // patch_size) * patch_size
-        if new_w != w or new_h != h:
-            padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
-            padded.paste(img, (0, 0))
-            return padded
-        return img
-    
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: pad_to_patch_size(img, 16)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
-    ])
-    return transform
-
-
 # Global variables (initialized in main)
 MODEL = None
 DEVICE = None  
 TOKENIZER = None
-IMAGE_TRANSFORM = None
+IMAGE_PROCESSOR = None
+
+
+
 
 
 def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.9):
@@ -88,13 +122,29 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
             image = Image.fromarray(image)
         image = image.convert('RGB')
         
-        # Process image
-        pixel_values = IMAGE_TRANSFORM(image).unsqueeze(0).to(DEVICE)
+        # Process image using src/data.py logic
+        # ImageProcessor returns (tensor, (grid_h, grid_w))
+        processed_image, _ = IMAGE_PROCESSOR(image)
+        pixel_values = processed_image.unsqueeze(0).to(DEVICE)
         
-        # Process text
-        inputs = TOKENIZER(text, return_tensors="pt", padding=True)
+        # Import image token constants
+        from src.data import IMAGE_TOKEN, NUM_IMAGE_TOKENS
+        
+        # Inject image tokens into the user message (256 tokens per image)
+        image_tokens = IMAGE_TOKEN * NUM_IMAGE_TOKENS
+        messages = [
+            {"role": "user", "content": image_tokens + text}
+        ]
+        
+        # Apply chat template
+        prompt = TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        inputs = TOKENIZER(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(DEVICE)
         attention_mask = inputs["attention_mask"].to(DEVICE)
+        
+        # Get image token ID
+        image_token_id = TOKENIZER.convert_tokens_to_ids(IMAGE_TOKEN)
         
         # Generate
         with torch.no_grad():
@@ -102,11 +152,13 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 attention_mask=attention_mask,
+                image_token_id=image_token_id,  # Pass to model for token replacement
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 do_sample=True,
                 pad_token_id=TOKENIZER.pad_token_id or TOKENIZER.eos_token_id,
+                eos_token_id=TOKENIZER.eos_token_id, 
             )
         
         # Decode response
@@ -181,6 +233,8 @@ def create_demo():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NanoQwenVL Gradio Demo")
+    parser.add_argument("--checkpoint_path", type=str, default=None, 
+                        help="Path to full model checkpoint (directory or file)")
     parser.add_argument("--lora_path", type=str, default=None, 
                         help="Path to LoRA checkpoint directory")
     parser.add_argument("--share", action="store_true", 
@@ -194,10 +248,10 @@ if __name__ == "__main__":
     print("Initializing NanoQwenVL Demo...")
     print("=" * 60)
     
-    MODEL, DEVICE = load_model(lora_path=args.lora_path)
+    MODEL, DEVICE = load_model(checkpoint_path=args.checkpoint_path, lora_path=args.lora_path)
     TOKENIZER = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
-    IMAGE_TRANSFORM = create_image_transform()
-    
+    IMAGE_PROCESSOR = ImageProcessor()  # Use same processor as training
+
     # Create and launch demo
     demo = create_demo()
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)

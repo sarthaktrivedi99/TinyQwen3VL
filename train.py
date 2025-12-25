@@ -2,6 +2,8 @@ import os
 import argparse
 import torch
 from transformers import Trainer, TrainingArguments, AutoTokenizer, TrainerCallback
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType
 from src.model import NanoQwenVL, NanoQwenVLConfig
@@ -24,6 +26,28 @@ class ResolutionCurriculumCallback(TrainerCallback):
             self.image_processor.set_max_resolution(None)  # Native resolution
             self.switched = True
 
+
+class ProjectorSaveCallback(TrainerCallback):
+    """Callback to save projector weights at every checkpoint (since LoRA doesn't save it)."""
+    
+    def __init__(self, model, output_dir):
+        self.model = model
+        self.output_dir = output_dir
+    
+    def on_save(self, args, state, control, **kwargs):
+        # Save projector to the checkpoint directory
+        checkpoint_dir = f"{self.output_dir}/checkpoint-{state.global_step}"
+        projector_path = f"{checkpoint_dir}/projector.pt"
+        
+        # Access projector through PEFT wrapper
+        try:
+            projector = self.model.base_model.model.projector
+        except AttributeError:
+            projector = self.model.projector
+        
+        torch.save(projector.state_dict(), projector_path)
+        print(f"[ProjectorSaveCallback] Saved projector to {projector_path}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NanoQwenVL model")
     
@@ -42,6 +66,7 @@ def parse_args():
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 precision (recommended for A100/H100)")
     parser.add_argument("--fp16", action="store_true", default=True, help="Use float16 precision (default: True)")
     parser.add_argument("--no_fp16", action="store_true", help="Disable fp16, use fp32")
+    parser.add_argument("--flash_attention", action="store_true", help="Use Flash Attention 2 (requires flash-attn package)")
     
     # Training arguments
     parser.add_argument("--output_dir", type=str, default="./nano_qwen_vl_checkpoints", help="Output directory")
@@ -78,10 +103,10 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    # CRITICAL: Add the image placeholder token
-    # This prevents the "token alignment" issues discussed earlier
-    if "<|image_pad|>" not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+    # CRITICAL: Add the Gemma 3 image token
+    from src.data import IMAGE_TOKEN
+    if IMAGE_TOKEN not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
 
     # ------------------------------------------------------------------
     # 2. Model Initialization
@@ -91,7 +116,8 @@ def train():
         llm_model_id=llm_model_id,
         vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
         freeze_vision=True, 
-        freeze_llm=False
+        freeze_llm=False,
+        use_flash_attention=args.flash_attention
     )
     
     model = NanoQwenVL(config)
@@ -150,7 +176,7 @@ def train():
     
     # Load the raw HF data first
     # Using streaming to avoid massive RAM usage
-    raw_dataset = load_dataset("HuggingFaceM4/FineVision", "CoSyn_400k_document", split="train", streaming=True)
+    raw_dataset = load_dataset("HuggingFaceM4/FineVision", "cocoqa", split="train", streaming=True)
     
     # Create image processor with resolution curriculum
     initial_max_res = None if args.no_curriculum else args.low_res
@@ -183,19 +209,24 @@ def train():
         report_to="none",
         gradient_checkpointing=False, # Disabled by user request
         dataloader_pin_memory=True,
-        dataloader_num_workers=4,  # Parallel data loading to prevent blocking
+        dataloader_num_workers=4,  # Parallel data loading
         dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker
+        accelerator_config={"dispatch_batches": False},  # Required for IterableDataset
         deepspeed=args.deepspeed,  # DeepSpeed config path (None if not used)
     )
     
     # ------------------------------------------------------------------
     # 6. Trainer Execution
     # ------------------------------------------------------------------
-    # Resolution curriculum callback
+    # Callbacks
     callbacks = []
     if not args.no_curriculum:
         print(f"Resolution curriculum: low res={args.low_res} -> native at step {args.res_switch_step}")
         callbacks.append(ResolutionCurriculumCallback(image_processor, switch_step=args.res_switch_step))
+    
+    # Add projector save callback when using LoRA (projector not saved by PEFT)
+    if use_lora:
+        callbacks.append(ProjectorSaveCallback(model, args.output_dir))
     
     trainer = Trainer(
         model=model,
@@ -208,8 +239,15 @@ def train():
     print("Starting training...")
     trainer.train()
     
-    # 7. Save
+    # 7. Save final model
     trainer.save_model(f"{args.output_dir}/final")
+    
+    # CRITICAL: Also save projector weights separately (not saved by LoRA)
+    if use_lora:
+        projector_path = f"{args.output_dir}/final/projector.pt"
+        torch.save(model.base_model.model.projector.state_dict(), projector_path)
+        print(f"Projector saved to {projector_path}")
+    
     print("Training finished and model saved.")
 
 if __name__ == "__main__":

@@ -18,15 +18,14 @@ VISION_CONFIG = {
     "vision_dim": 768,  # NaFlexViT Base embedding dimension
 }
 
+# Gemma 3 uses 256 soft tokens per image
+NUM_IMAGE_TOKENS = 256
+IMAGE_TOKEN = "<start_of_image>"
 
-def get_image_string(tokenizer, splitted_image_counts, mp_image_token_length):
-    """Generate image token string for the given image counts."""
-    image_tokens = []
-    for count in splitted_image_counts:
-        h, w = count if isinstance(count, (list, tuple)) else (count, count)
-        num_tokens = h * w * mp_image_token_length
-        image_tokens.append(tokenizer.image_token * num_tokens)
-    return "".join(image_tokens)
+
+def get_image_string(tokenizer, num_images=1):
+    """Generate image token string for Gemma 3 (256 tokens per image)."""
+    return IMAGE_TOKEN * NUM_IMAGE_TOKENS * num_images
 
 
 class ImageProcessor:
@@ -123,13 +122,11 @@ class BaseDataset(Dataset):
         self.visual_dependency_min_rating = visual_dependency_min_rating
         self.formatting_min_rating = formatting_min_rating
         
-        # Set up image token if not present
-        if not hasattr(tokenizer, 'image_token'):
-            if "<|image_pad|>" in tokenizer.get_vocab():
-                self.tokenizer.image_token = "<|image_pad|>"
-            else:
-                tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
-                self.tokenizer.image_token = "<|image_pad|>"
+        # Set up Gemma 3 image token if not present
+        if IMAGE_TOKEN not in tokenizer.get_vocab():
+            tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
+        self.image_token = IMAGE_TOKEN
+        self.image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         
         self.prefix_len = self._get_prefix_len()
 
@@ -150,8 +147,7 @@ class BaseDataset(Dataset):
         except Exception:
             return 0
 
-    def _get_messages(self, item, splitted_image_counts):
-        """Extract and filter messages from item."""
+    def _get_messages(self, item, num_images=0):
         messages = []
         texts = item.get('texts', [])
         
@@ -182,12 +178,12 @@ class BaseDataset(Dataset):
 
         # Safety: remove any existing image tokens
         for msg in messages:
-            if self.tokenizer.image_token in msg["content"]:
-                msg["content"] = msg["content"].replace(self.tokenizer.image_token, "")
+            if self.image_token in msg["content"]:
+                msg["content"] = msg["content"].replace(self.image_token, "")
 
-        # Prepend image tokens to first message
-        if len(splitted_image_counts) > 0:
-            image_string = get_image_string(self.tokenizer, splitted_image_counts, self.mp_image_token_length)
+        # Prepend image tokens to first message (256 tokens per image)
+        if num_images > 0:
+            image_string = get_image_string(self.tokenizer, num_images)
             messages[0]["content"] = image_string + messages[0]["content"]
 
         return messages
@@ -217,15 +213,18 @@ class BaseDataset(Dataset):
             add_special_tokens=False,
             return_dict=True,
         )
-        input_ids = conv_result["input_ids"]
+        input_ids = list(conv_result["input_ids"])
+        
+        # Add EOS token at the end if not already present
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is not None and (len(input_ids) == 0 or input_ids[-1] != eos_token_id):
+            input_ids.append(eos_token_id)
+        
         mask = [0] * len(input_ids)
         
         # For Gemma and similar models, we identify assistant tokens by:
         # 1. Finding the encoded assistant content in the full sequence
         # 2. Marking those positions as trainable
-        
-        # Get the full tokenized output as string for analysis
-        full_text = self.tokenizer.decode(input_ids)
         
         for msg in messages:
             if msg["role"] == "assistant":
@@ -240,11 +239,15 @@ class BaseDataset(Dataset):
                         if input_ids[i:i+content_len] == content_ids:
                             mask[i:i+content_len] = [1] * content_len
                             break
+        
+        # Also train on EOS token (important for generation to know when to stop)
+        if eos_token_id is not None and len(input_ids) > 0 and input_ids[-1] == eos_token_id:
+            mask[-1] = 1
 
         return (
             torch.tensor(input_ids),
             torch.tensor(mask).to(torch.bool),
-            torch.tensor(conv_result.get("attention_mask", [1] * len(input_ids)))
+            torch.tensor([1] * len(input_ids))  # All tokens are attended to
         )
 
 
@@ -265,11 +268,12 @@ class VQADataset(BaseDataset):
             images_data = [images_data]
 
         processed_images = []
-        splitted_image_counts = []
+        num_images = 0
         if images_data:
-            processed_images, splitted_image_counts = self._process_images(images_data)
+            processed_images, _ = self._process_images(images_data)
+            num_images = len(processed_images)
 
-        messages = self._get_messages(item, splitted_image_counts)
+        messages = self._get_messages(item, num_images)
 
         if len(messages) == 0:
             return None
@@ -288,6 +292,7 @@ class VQADataset(BaseDataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "image_token_id": self.image_token_id,
         }
 
     def _get_labels(self, input_ids, mask):
@@ -319,11 +324,12 @@ class VQAIterableDataset(IterableDataset, BaseDataset):
             images_data = [images_data]
 
         processed_images = []
-        splitted_image_counts = []
+        num_images = 0
         if images_data:
-            processed_images, splitted_image_counts = self._process_images(images_data)
+            processed_images, _ = self._process_images(images_data)
+            num_images = len(processed_images)
 
-        messages = self._get_messages(item, splitted_image_counts)
+        messages = self._get_messages(item, num_images)
 
         if len(messages) == 0:
             return None
@@ -341,6 +347,7 @@ class VQAIterableDataset(IterableDataset, BaseDataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "image_token_id": self.image_token_id,
         }
     
     def _get_labels(self, input_ids, mask):
@@ -402,6 +409,12 @@ def collate_fn(batch):
     
     if pixel_values is not None:
         result["pixel_values"] = pixel_values
+    
+    # Get image_token_id from first item and replicate for batch
+    # This ensures it can be sliced by accelerate if split_batches=True
+    if batch and isinstance(batch[0], dict) and 'image_token_id' in batch[0]:
+        token_id = batch[0]["image_token_id"]
+        result["image_token_id"] = torch.tensor([token_id] * len(batch))
     
     return result
 
