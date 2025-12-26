@@ -174,16 +174,34 @@ def train():
     # ------------------------------------------------------------------
     print("Initialize Dataset...")
     
-    # Load the raw HF data first (all subsets)
-    # Using streaming to avoid massive RAM usage
-    raw_dataset = load_dataset("HuggingFaceM4/FineVision", split="train", streaming=False)
+    # Load multiple subsets for diversity
+    # We select a mix of general VQA, OCR, and Document tasks
+    configs = ["cocoqa", "textvqa", "docvqa", "chartqa", "scienceqa"]
+    print(f"Loading datasets: {configs}")
+    
+    from datasets import concatenate_datasets
+    datasets_list = []
+    for config_name in configs:
+        try:
+            ds = load_dataset("HuggingFaceM4/FineVision", config_name, split="train", streaming=False)
+            datasets_list.append(ds)
+            print(f"Loaded {config_name}: {len(ds)} samples")
+        except Exception as e:
+            print(f"Failed to load {config_name}: {e}")
+            
+    if not datasets_list:
+        raise ValueError("Failed to load any datasets!")
+        
+    raw_dataset = concatenate_datasets(datasets_list)
+    print(f"Total training samples: {len(raw_dataset)}")
     
     # Create image processor with resolution curriculum
     initial_max_res = None if args.no_curriculum else args.low_res
     image_processor = ImageProcessor(max_resolution=initial_max_res)
     
-    # Create dataset with new VQAIterableDataset
-    train_dataset = VQAIterableDataset(
+    # Create dataset with VQADataset (Map-style since streaming=False)
+    from src.data import VQADataset
+    train_dataset = VQADataset(
         dataset=raw_dataset, 
         tokenizer=tokenizer,
         image_processor=image_processor,
