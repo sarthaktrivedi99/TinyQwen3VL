@@ -174,7 +174,7 @@ def train():
     
     # Load the raw HF data first
     # Using streaming to avoid massive RAM usage
-    raw_dataset = load_dataset("HuggingFaceM4/FineVision", "CoSyn_400k_document", split="train", streaming=True)
+    raw_dataset = load_dataset("HuggingFaceM4/FineVision", "cocoqa", split="train", streaming=True)
     
     # Create image processor with resolution curriculum
     initial_max_res = None if args.no_curriculum else args.low_res
@@ -209,6 +209,7 @@ def train():
         dataloader_pin_memory=True,
         dataloader_num_workers=4,  # Parallel data loading to prevent blocking
         dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker
+        dispatch_batches=False,  # Required for IterableDataset with variable sizes
         deepspeed=args.deepspeed,  # DeepSpeed config path (None if not used)
     )
     
