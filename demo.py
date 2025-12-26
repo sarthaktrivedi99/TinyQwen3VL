@@ -14,8 +14,10 @@ from peft import PeftModel
 from src.model import NanoQwenVL, NanoQwenVLConfig
 
 
-def load_model(lora_path=None):
-    """Load the model (optionally with LoRA checkpoint)."""
+def load_model(checkpoint_path=None, lora_path=None):
+    """Load the model (optionally with full checkpoint or LoRA adapter)."""
+    import os
+    
     print("Loading base model...")
     
     config = NanoQwenVLConfig(
@@ -27,14 +29,38 @@ def load_model(lora_path=None):
     
     model = NanoQwenVL(config)
     
-    if lora_path:
+    if checkpoint_path:
+        # Load full checkpoint (all weights)
+        print(f"Loading full checkpoint from {checkpoint_path}...")
+        if os.path.isdir(checkpoint_path):
+            # Directory with pytorch_model.bin or model.safetensors
+            import glob
+            ckpt_file = None
+            for pattern in ["pytorch_model.bin", "model.safetensors", "*.pt", "*.pth"]:
+                matches = glob.glob(os.path.join(checkpoint_path, pattern))
+                if matches:
+                    ckpt_file = matches[0]
+                    break
+            if ckpt_file:
+                state_dict = torch.load(ckpt_file, map_location="cpu")
+                model.load_state_dict(state_dict, strict=False)
+                print(f"Loaded checkpoint from {ckpt_file}")
+            else:
+                print(f"Warning: No checkpoint file found in {checkpoint_path}")
+        else:
+            # Single file
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            model.load_state_dict(state_dict, strict=False)
+            print(f"Loaded checkpoint from {checkpoint_path}")
+    
+    elif lora_path:
+        # Load LoRA adapter
         print(f"Loading LoRA adapter from {lora_path}...")
         model = PeftModel.from_pretrained(model, lora_path)
         model = model.merge_and_unload()  # Merge for faster inference
         print("LoRA adapter loaded and merged.")
         
         # Also load projector weights (saved separately)
-        import os
         projector_path = os.path.join(lora_path, "projector.pt")
         if os.path.exists(projector_path):
             print(f"Loading projector from {projector_path}...")
@@ -47,7 +73,7 @@ def load_model(lora_path=None):
     model.eval()
     
     # Move to GPU if available
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model = model.to(device)
     print(f"Model loaded on {device}")
     
@@ -192,6 +218,8 @@ def create_demo():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NanoQwenVL Gradio Demo")
+    parser.add_argument("--checkpoint_path", type=str, default=None, 
+                        help="Path to full model checkpoint (directory or file)")
     parser.add_argument("--lora_path", type=str, default=None, 
                         help="Path to LoRA checkpoint directory")
     parser.add_argument("--share", action="store_true", 
@@ -205,7 +233,7 @@ if __name__ == "__main__":
     print("Initializing NanoQwenVL Demo...")
     print("=" * 60)
     
-    MODEL, DEVICE = load_model(lora_path=args.lora_path)
+    MODEL, DEVICE = load_model(checkpoint_path=args.checkpoint_path, lora_path=args.lora_path)
     TOKENIZER = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
     IMAGE_TRANSFORM = create_image_transform()
     
