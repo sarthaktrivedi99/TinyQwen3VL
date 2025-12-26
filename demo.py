@@ -14,6 +14,15 @@ from peft import PeftModel
 from src.model import NanoQwenVL, NanoQwenVLConfig
 
 
+def _load_checkpoint(filepath):
+    """Load checkpoint from either safetensors or pytorch format."""
+    if filepath.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return load_file(filepath)
+    else:
+        return torch.load(filepath, map_location="cpu")
+
+
 def load_model(checkpoint_path=None, lora_path=None):
     """Load the model (optionally with full checkpoint or LoRA adapter)."""
     import os
@@ -36,20 +45,20 @@ def load_model(checkpoint_path=None, lora_path=None):
             # Directory with pytorch_model.bin or model.safetensors
             import glob
             ckpt_file = None
-            for pattern in ["pytorch_model.bin", "model.safetensors", "*.pt", "*.pth"]:
+            for pattern in ["model.safetensors", "pytorch_model.bin", "*.pt", "*.pth"]:
                 matches = glob.glob(os.path.join(checkpoint_path, pattern))
                 if matches:
                     ckpt_file = matches[0]
                     break
             if ckpt_file:
-                state_dict = torch.load(ckpt_file, map_location="cpu")
+                state_dict = _load_checkpoint(ckpt_file)
                 model.load_state_dict(state_dict, strict=False)
                 print(f"Loaded checkpoint from {ckpt_file}")
             else:
                 print(f"Warning: No checkpoint file found in {checkpoint_path}")
         else:
             # Single file
-            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            state_dict = _load_checkpoint(checkpoint_path)
             model.load_state_dict(state_dict, strict=False)
             print(f"Loaded checkpoint from {checkpoint_path}")
     
