@@ -148,7 +148,6 @@ class BaseDataset(Dataset):
             return 0
 
     def _get_messages(self, item, num_images=0):
-        \"\"\"Extract and filter messages from item.\"\"\"
         messages = []
         texts = item.get('texts', [])
         
