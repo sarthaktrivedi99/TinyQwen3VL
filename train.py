@@ -174,9 +174,9 @@ def train():
     # ------------------------------------------------------------------
     print("Initialize Dataset...")
     
-    # Load the raw HF data first
+    # Load the raw HF data first (all subsets)
     # Using streaming to avoid massive RAM usage
-    raw_dataset = load_dataset("HuggingFaceM4/FineVision", "cocoqa", split="train", streaming=True)
+    raw_dataset = load_dataset("HuggingFaceM4/FineVision", split="train", streaming=False)
     
     # Create image processor with resolution curriculum
     initial_max_res = None if args.no_curriculum else args.low_res
