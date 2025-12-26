@@ -12,6 +12,7 @@ from timm.data import resolve_model_data_config
 from peft import PeftModel
 
 from src.model import NanoQwenVL, NanoQwenVLConfig
+from src.data import ImageProcessor
 
 
 def _load_checkpoint(filepath):
@@ -98,36 +99,14 @@ def load_model(checkpoint_path=None, lora_path=None):
     return model, device
 
 
-def create_image_transform():
-    """Create image transform for PE-Core."""
-    temp_model = timm.create_model("naflexvit_base_patch16_siglip.v2_webli", pretrained=False)
-    data_config = resolve_model_data_config(temp_model)
-    mean = data_config.get('mean', (0.5, 0.5, 0.5))
-    std = data_config.get('std', (0.5, 0.5, 0.5))
-    
-    def pad_to_patch_size(img, patch_size=16):
-        w, h = img.size
-        new_w = ((w + patch_size - 1) // patch_size) * patch_size
-        new_h = ((h + patch_size - 1) // patch_size) * patch_size
-        if new_w != w or new_h != h:
-            padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
-            padded.paste(img, (0, 0))
-            return padded
-        return img
-    
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: pad_to_patch_size(img, 16)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
-    ])
-    return transform
-
-
 # Global variables (initialized in main)
 MODEL = None
 DEVICE = None  
 TOKENIZER = None
-IMAGE_TRANSFORM = None
+IMAGE_PROCESSOR = None
+
+
+
 
 
 def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.9):
@@ -143,8 +122,10 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
             image = Image.fromarray(image)
         image = image.convert('RGB')
         
-        # Process image
-        pixel_values = IMAGE_TRANSFORM(image).unsqueeze(0).to(DEVICE)
+        # Process image using src/data.py logic
+        # ImageProcessor returns (pixel_values, splitted_image_counts)
+        pixel_values, _ = IMAGE_PROCESSOR([image])
+        pixel_values = pixel_values.to(DEVICE)
         
         # Process text with chat template
         messages = [
@@ -262,8 +243,8 @@ if __name__ == "__main__":
     
     MODEL, DEVICE = load_model(checkpoint_path=args.checkpoint_path, lora_path=args.lora_path)
     TOKENIZER = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
-    IMAGE_TRANSFORM = create_image_transform()
-    
+    IMAGE_PROCESSOR = ImageProcessor()  # Use same processor as training
+
     # Create and launch demo
     demo = create_demo()
     demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
