@@ -146,8 +146,16 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
         # Process image
         pixel_values = IMAGE_TRANSFORM(image).unsqueeze(0).to(DEVICE)
         
-        # Process text
-        inputs = TOKENIZER(text, return_tensors="pt", padding=True)
+        # Process text with chat template
+        messages = [
+            {"role": "user", "content": text}
+        ]
+        # Apply chat template (which adds <bos>, roles, etc.)
+        # Note: We need to handle the image token manually since the template might not include it
+        # But for now let's just use the strict template
+        prompt = TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        inputs = TOKENIZER(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(DEVICE)
         attention_mask = inputs["attention_mask"].to(DEVICE)
         
@@ -162,6 +170,7 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
                 top_p=top_p,
                 do_sample=True,
                 pad_token_id=TOKENIZER.pad_token_id or TOKENIZER.eos_token_id,
+                eos_token_id=TOKENIZER.eos_token_id, 
             )
         
         # Decode response
