@@ -127,18 +127,24 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
         processed_image, _ = IMAGE_PROCESSOR(image)
         pixel_values = processed_image.unsqueeze(0).to(DEVICE)
         
-        # Process text with chat template
+        # Import image token constants
+        from src.data import IMAGE_TOKEN, NUM_IMAGE_TOKENS
+        
+        # Inject image tokens into the user message (256 tokens per image)
+        image_tokens = IMAGE_TOKEN * NUM_IMAGE_TOKENS
         messages = [
-            {"role": "user", "content": text}
+            {"role": "user", "content": image_tokens + text}
         ]
-        # Apply chat template (which adds <bos>, roles, etc.)
-        # Note: We need to handle the image token manually since the template might not include it
-        # But for now let's just use the strict template
+        
+        # Apply chat template
         prompt = TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         
         inputs = TOKENIZER(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(DEVICE)
         attention_mask = inputs["attention_mask"].to(DEVICE)
+        
+        # Get image token ID
+        image_token_id = TOKENIZER.convert_tokens_to_ids(IMAGE_TOKEN)
         
         # Generate
         with torch.no_grad():
@@ -146,6 +152,7 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 attention_mask=attention_mask,
+                image_token_id=image_token_id,  # Pass to model for token replacement
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,

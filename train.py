@@ -101,10 +101,10 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    # CRITICAL: Add the image placeholder token
-    # This prevents the "token alignment" issues discussed earlier
-    if "<|image_pad|>" not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+    # CRITICAL: Add the Gemma 3 image token
+    from src.data import IMAGE_TOKEN
+    if IMAGE_TOKEN not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
 
     # ------------------------------------------------------------------
     # 2. Model Initialization

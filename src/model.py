@@ -148,82 +148,70 @@ class NanoQwenVL(PreTrainedModel):
         pixel_values=None,
         attention_mask=None,
         labels=None,
+        image_token_id=None,  # Token ID for <start_of_image>
         **kwargs
     ):
+        """
+        Forward pass with Gemma 3 style image token replacement.
+        Image tokens in input_ids are replaced with projected vision embeddings.
+        """
+        from src.data import NUM_IMAGE_TOKENS
         
+        # Get text embeddings
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
-        if pixel_values is not None:
-            # 1. Forward Vision Tower using forward_features to get patch embeddings
-            # NaFlexViT outputs: [batch, num_tokens, vision_dim] e.g., [B, num_patches, 768]
+        if pixel_values is not None and image_token_id is not None:
+            # 1. Get vision features
             vision_outputs = self.vision_tower.forward_features(pixel_values)
             
-            # Ensure 3D tensor [B, num_patches, dim] - some models may return 2D
+            # Ensure 3D: [B, num_patches, vision_dim]
             if vision_outputs.dim() == 2:
-                vision_outputs = vision_outputs.unsqueeze(0)  # Add batch dim if missing
+                vision_outputs = vision_outputs.unsqueeze(0)
             
-            # 2. Project to LLM dimension [batch, num_tokens, llm_dim]
-            image_embeds = self.projector(vision_outputs)  # [B, num_patches, LLM_Dim]
+            # 2. Project to LLM dimension and pool to 256 tokens per image
+            # vision_outputs: [B, num_patches, vision_dim] -> [B, 256, llm_dim]
+            batch_size = vision_outputs.shape[0]
+            num_patches = vision_outputs.shape[1]
             
-            # 3. Merge into LLM sequence
-            # Prepend image embeddings to text for each item in batch
-            new_inputs_embeds = []
-            new_attention_mask = []
-            new_labels = []
-
-            for i in range(len(inputs_embeds)):
-                # Get components for this batch item
-                txt_emb = inputs_embeds[i]  # [Seq, Dim]
-                img_emb = image_embeds[i]    # [num_patches, Dim]
-                
-                # Ensure 2D tensors for concatenation [Seq, Dim]
-                if txt_emb.dim() == 1:
-                    txt_emb = txt_emb.unsqueeze(0)  # [1, Dim]
-                if img_emb.dim() == 1:
-                    img_emb = img_emb.unsqueeze(0)  # [1, Dim]
-                
-                # Concatenate [Image, Text] along sequence dimension
-                combined_emb = torch.cat([img_emb, txt_emb], dim=0)
-                new_inputs_embeds.append(combined_emb)
-                
-                # Handle Attention Mask
-                if attention_mask is not None:
-                    cur_mask = attention_mask[i]
-                    # Ensure 1D mask
-                    if cur_mask.dim() == 0:
-                        cur_mask = cur_mask.unsqueeze(0)
-                    # Create mask for image (ones)
-                    img_mask = torch.ones(img_emb.shape[0], device=cur_mask.device, dtype=cur_mask.dtype)
-                    combined_mask = torch.cat([img_mask, cur_mask], dim=0)
-                    new_attention_mask.append(combined_mask)
-                
-                # Handle Labels
-                if labels is not None:
-                    cur_lbl = labels[i]
-                    img_lbl = torch.full((img_emb.shape[0],), -100, device=cur_lbl.device, dtype=cur_lbl.dtype)
-                    combined_lbl = torch.cat([img_lbl, cur_lbl], dim=0)
-                    new_labels.append(combined_lbl)
-
-            # Pad the batch to the longest sequence
-            from torch.nn.utils.rnn import pad_sequence
+            # Adaptive pooling to get exactly 256 tokens
+            # Reshape: [B, num_patches, dim] -> [B, dim, num_patches]
+            vision_outputs = vision_outputs.transpose(1, 2)
+            # Pool: [B, dim, num_patches] -> [B, dim, 256]
+            vision_pooled = nn.functional.adaptive_avg_pool1d(vision_outputs, NUM_IMAGE_TOKENS)
+            # Reshape back: [B, dim, 256] -> [B, 256, dim]
+            vision_pooled = vision_pooled.transpose(1, 2)
             
-            inputs_embeds = pad_sequence(new_inputs_embeds, batch_first=True)
-            if attention_mask is not None:
-                # Pad with 0
-                attention_mask = pad_sequence(new_attention_mask, batch_first=True, padding_value=0)
-            if labels is not None:
-                # Pad with -100
-                labels = pad_sequence(new_labels, batch_first=True, padding_value=-100)
-
+            # Project to LLM dimension
+            image_embeds = self.projector(vision_pooled)  # [B, 256, llm_dim]
+            
+            # 3. Replace image tokens in inputs_embeds
+            for batch_idx in range(inputs_embeds.shape[0]):
+                # Find positions of image tokens
+                image_mask = (input_ids[batch_idx] == image_token_id)
+                image_positions = torch.where(image_mask)[0]
+                
+                if len(image_positions) > 0:
+                    # Get image embedding for this batch item
+                    img_emb = image_embeds[batch_idx if batch_idx < batch_size else 0]
+                    
+                    # Replace embeddings at image token positions
+                    num_to_replace = min(len(image_positions), img_emb.shape[0])
+                    for j in range(num_to_replace):
+                        pos = image_positions[j]
+                        inputs_embeds[batch_idx, pos] = img_emb[j]
+                    
+                    # Set labels to -100 for image positions (don't compute loss)
+                    if labels is not None:
+                        labels[batch_idx, image_positions[:num_to_replace]] = -100
+        
         # Clean kwargs
         kwargs.pop('inputs_embeds', None)
         kwargs.pop('attention_mask', None) 
         kwargs.pop('labels', None)
         kwargs.pop('input_ids', None)
         kwargs.pop('return_dict', None)
-        
-        # Explicitly remove vision args so LLM doesn't complain
         kwargs.pop('pixel_values', None)
+        kwargs.pop('image_token_id', None)
 
         return self.llm(
             inputs_embeds=inputs_embeds,
@@ -242,48 +230,41 @@ class NanoQwenVL(PreTrainedModel):
         input_ids=None,
         pixel_values=None,
         attention_mask=None,
+        image_token_id=None,  # Token ID for <start_of_image>
         **kwargs
     ):
+        """Generate with Gemma 3 style image token replacement."""
+        from src.data import NUM_IMAGE_TOKENS
+        
         # Get text embeddings
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
-        if pixel_values is not None:
-            # Use forward_features for patch embeddings
+        if pixel_values is not None and image_token_id is not None:
+            # Get vision features
             vision_outputs = self.vision_tower.forward_features(pixel_values)
             
-            # Ensure 3D tensor [B, num_patches, dim]
             if vision_outputs.dim() == 2:
                 vision_outputs = vision_outputs.unsqueeze(0)
             
-            image_embeds = self.projector(vision_outputs)
+            # Pool to 256 tokens
+            batch_size = vision_outputs.shape[0]
+            vision_outputs = vision_outputs.transpose(1, 2)
+            vision_pooled = nn.functional.adaptive_avg_pool1d(vision_outputs, NUM_IMAGE_TOKENS)
+            vision_pooled = vision_pooled.transpose(1, 2)
             
-            new_inputs_embeds = []
-            new_attention_mask = []
+            image_embeds = self.projector(vision_pooled)
             
-            for i in range(len(inputs_embeds)):
-                img_emb = image_embeds[i]
-                txt_emb = inputs_embeds[i]
+            # Replace image tokens
+            for batch_idx in range(inputs_embeds.shape[0]):
+                image_mask = (input_ids[batch_idx] == image_token_id)
+                image_positions = torch.where(image_mask)[0]
                 
-                # Ensure 2D tensors [Seq, Dim]
-                if txt_emb.dim() == 1:
-                    txt_emb = txt_emb.unsqueeze(0)
-                if img_emb.dim() == 1:
-                    img_emb = img_emb.unsqueeze(0)
-                
-                combined_emb = torch.cat([img_emb, txt_emb], dim=0)
-                new_inputs_embeds.append(combined_emb)
-                
-                if attention_mask is not None:
-                    cur_mask = attention_mask[i]
-                    if cur_mask.dim() == 0:
-                        cur_mask = cur_mask.unsqueeze(0)
-                    img_mask = torch.ones(img_emb.shape[0], device=cur_mask.device, dtype=cur_mask.dtype)
-                    new_attention_mask.append(torch.cat([img_mask, cur_mask], dim=0))
-
-            from torch.nn.utils.rnn import pad_sequence
-            inputs_embeds = pad_sequence(new_inputs_embeds, batch_first=True)
-            if attention_mask is not None:
-                attention_mask = pad_sequence(new_attention_mask, batch_first=True, padding_value=0)
+                if len(image_positions) > 0:
+                    img_emb = image_embeds[batch_idx if batch_idx < batch_size else 0]
+                    num_to_replace = min(len(image_positions), img_emb.shape[0])
+                    for j in range(num_to_replace):
+                        pos = image_positions[j]
+                        inputs_embeds[batch_idx, pos] = img_emb[j]
 
         return self.llm.generate(
             inputs_embeds=inputs_embeds,

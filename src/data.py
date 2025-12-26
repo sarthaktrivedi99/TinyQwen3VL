@@ -18,15 +18,14 @@ VISION_CONFIG = {
     "vision_dim": 768,  # NaFlexViT Base embedding dimension
 }
 
+# Gemma 3 uses 256 soft tokens per image
+NUM_IMAGE_TOKENS = 256
+IMAGE_TOKEN = "<start_of_image>"
 
-def get_image_string(tokenizer, splitted_image_counts, mp_image_token_length):
-    """Generate image token string for the given image counts."""
-    image_tokens = []
-    for count in splitted_image_counts:
-        h, w = count if isinstance(count, (list, tuple)) else (count, count)
-        num_tokens = h * w * mp_image_token_length
-        image_tokens.append(tokenizer.image_token * num_tokens)
-    return "".join(image_tokens)
+
+def get_image_string(tokenizer, num_images=1):
+    """Generate image token string for Gemma 3 (256 tokens per image)."""
+    return IMAGE_TOKEN * NUM_IMAGE_TOKENS * num_images
 
 
 class ImageProcessor:
@@ -123,13 +122,11 @@ class BaseDataset(Dataset):
         self.visual_dependency_min_rating = visual_dependency_min_rating
         self.formatting_min_rating = formatting_min_rating
         
-        # Set up image token if not present
-        if not hasattr(tokenizer, 'image_token'):
-            if "<|image_pad|>" in tokenizer.get_vocab():
-                self.tokenizer.image_token = "<|image_pad|>"
-            else:
-                tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
-                self.tokenizer.image_token = "<|image_pad|>"
+        # Set up Gemma 3 image token if not present
+        if IMAGE_TOKEN not in tokenizer.get_vocab():
+            tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
+        self.image_token = IMAGE_TOKEN
+        self.image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         
         self.prefix_len = self._get_prefix_len()
 
@@ -150,8 +147,8 @@ class BaseDataset(Dataset):
         except Exception:
             return 0
 
-    def _get_messages(self, item, splitted_image_counts):
-        """Extract and filter messages from item."""
+    def _get_messages(self, item, num_images=0):
+        \"\"\"Extract and filter messages from item.\"\"\"
         messages = []
         texts = item.get('texts', [])
         
@@ -182,12 +179,12 @@ class BaseDataset(Dataset):
 
         # Safety: remove any existing image tokens
         for msg in messages:
-            if self.tokenizer.image_token in msg["content"]:
-                msg["content"] = msg["content"].replace(self.tokenizer.image_token, "")
+            if self.image_token in msg["content"]:
+                msg["content"] = msg["content"].replace(self.image_token, "")
 
-        # Prepend image tokens to first message
-        if len(splitted_image_counts) > 0:
-            image_string = get_image_string(self.tokenizer, splitted_image_counts, self.mp_image_token_length)
+        # Prepend image tokens to first message (256 tokens per image)
+        if num_images > 0:
+            image_string = get_image_string(self.tokenizer, num_images)
             messages[0]["content"] = image_string + messages[0]["content"]
 
         return messages
@@ -272,11 +269,12 @@ class VQADataset(BaseDataset):
             images_data = [images_data]
 
         processed_images = []
-        splitted_image_counts = []
+        num_images = 0
         if images_data:
-            processed_images, splitted_image_counts = self._process_images(images_data)
+            processed_images, _ = self._process_images(images_data)
+            num_images = len(processed_images)
 
-        messages = self._get_messages(item, splitted_image_counts)
+        messages = self._get_messages(item, num_images)
 
         if len(messages) == 0:
             return None
@@ -295,6 +293,7 @@ class VQADataset(BaseDataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "image_token_id": self.image_token_id,
         }
 
     def _get_labels(self, input_ids, mask):
@@ -409,6 +408,10 @@ def collate_fn(batch):
     
     if pixel_values is not None:
         result["pixel_values"] = pixel_values
+    
+    # Get image_token_id from first item (all items should have same tokenizer)
+    if batch and hasattr(batch[0], 'get') and 'image_token_id' in batch[0]:
+        result["image_token_id"] = batch[0]["image_token_id"]
     
     return result
 
