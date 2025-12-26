@@ -411,9 +411,9 @@ def collate_fn(batch):
     if pixel_values is not None:
         result["pixel_values"] = pixel_values
     
-    # Get image_token_id from first item (all items should have same tokenizer)
-    if batch and hasattr(batch[0], 'get') and 'image_token_id' in batch[0]:
-        result["image_token_id"] = batch[0]["image_token_id"]
+    # Get image_token_id from first item (convert to tensor for device compatibility)
+    if batch and isinstance(batch[0], dict) and 'image_token_id' in batch[0]:
+        result["image_token_id"] = torch.tensor(batch[0]["image_token_id"])
     
     return result
 

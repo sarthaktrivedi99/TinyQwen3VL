@@ -160,6 +160,10 @@ class NanoQwenVL(PreTrainedModel):
         # Get text embeddings
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
+        # Convert image_token_id to int if it's a tensor
+        if image_token_id is not None and hasattr(image_token_id, 'item'):
+            image_token_id = image_token_id.item()
+        
         if pixel_values is not None and image_token_id is not None:
             # 1. Get vision features
             vision_outputs = self.vision_tower.forward_features(pixel_values)
@@ -238,6 +242,10 @@ class NanoQwenVL(PreTrainedModel):
         
         # Get text embeddings
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
+        
+        # Convert image_token_id to int if it's a tensor
+        if image_token_id is not None and hasattr(image_token_id, 'item'):
+            image_token_id = image_token_id.item()
         
         if pixel_values is not None and image_token_id is not None:
             # Get vision features
