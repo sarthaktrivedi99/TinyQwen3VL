@@ -211,7 +211,7 @@ def train():
         dataloader_pin_memory=True,
         dataloader_num_workers=4,  # Parallel data loading
         dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker
-        accelerator_config={"split_batches": True},  # Required for IterableDataset
+        accelerator_config={"dispatch_batches": False},  # Required for IterableDataset
         deepspeed=args.deepspeed,  # DeepSpeed config path (None if not used)
     )
     

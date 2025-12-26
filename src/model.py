@@ -161,8 +161,12 @@ class NanoQwenVL(PreTrainedModel):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
         # Convert image_token_id to int if it's a tensor
-        if image_token_id is not None and hasattr(image_token_id, 'item'):
-            image_token_id = image_token_id.item()
+        if image_token_id is not None:
+            if isinstance(image_token_id, torch.Tensor):
+                if image_token_id.numel() > 1:
+                    image_token_id = image_token_id[0].item()
+                else:
+                    image_token_id = image_token_id.item()
         
         if pixel_values is not None and image_token_id is not None:
             # 1. Get vision features
@@ -244,8 +248,12 @@ class NanoQwenVL(PreTrainedModel):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
         
         # Convert image_token_id to int if it's a tensor
-        if image_token_id is not None and hasattr(image_token_id, 'item'):
-            image_token_id = image_token_id.item()
+        if image_token_id is not None:
+            if isinstance(image_token_id, torch.Tensor):
+                if image_token_id.numel() > 1:
+                    image_token_id = image_token_id[0].item()
+                else:
+                    image_token_id = image_token_id.item()
         
         if pixel_values is not None and image_token_id is not None:
             # Get vision features

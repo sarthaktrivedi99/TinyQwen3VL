@@ -411,9 +411,11 @@ def collate_fn(batch):
     if pixel_values is not None:
         result["pixel_values"] = pixel_values
     
-    # Get image_token_id from first item (convert to tensor for device compatibility)
+    # Get image_token_id from first item and replicate for batch
+    # This ensures it can be sliced by accelerate if split_batches=True
     if batch and isinstance(batch[0], dict) and 'image_token_id' in batch[0]:
-        result["image_token_id"] = torch.tensor(batch[0]["image_token_id"])
+        token_id = batch[0]["image_token_id"]
+        result["image_token_id"] = torch.tensor([token_id] * len(batch))
     
     return result
 
