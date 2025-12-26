@@ -325,11 +325,12 @@ class VQAIterableDataset(IterableDataset, BaseDataset):
             images_data = [images_data]
 
         processed_images = []
-        splitted_image_counts = []
+        num_images = 0
         if images_data:
-            processed_images, splitted_image_counts = self._process_images(images_data)
+            processed_images, _ = self._process_images(images_data)
+            num_images = len(processed_images)
 
-        messages = self._get_messages(item, splitted_image_counts)
+        messages = self._get_messages(item, num_images)
 
         if len(messages) == 0:
             return None
@@ -347,6 +348,7 @@ class VQAIterableDataset(IterableDataset, BaseDataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "image_token_id": self.image_token_id,
         }
     
     def _get_labels(self, input_ids, mask):
