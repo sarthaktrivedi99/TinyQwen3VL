@@ -123,9 +123,9 @@ def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.
         image = image.convert('RGB')
         
         # Process image using src/data.py logic
-        # ImageProcessor returns (pixel_values, splitted_image_counts)
-        pixel_values, _ = IMAGE_PROCESSOR([image])
-        pixel_values = pixel_values.to(DEVICE)
+        # ImageProcessor returns (tensor, (grid_h, grid_w))
+        processed_image, _ = IMAGE_PROCESSOR(image)
+        pixel_values = processed_image.unsqueeze(0).to(DEVICE)
         
         # Process text with chat template
         messages = [
