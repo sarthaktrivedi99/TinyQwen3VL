@@ -7,7 +7,63 @@ from accelerate.utils import DistributedDataParallelKwargs
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType
 from src.model import NanoQwenVL, NanoQwenVLConfig
-from src.data import VQAIterableDataset, ImageProcessor, collate_fn
+from src.data import VQADataset, ImageProcessor, collate_fn
+
+
+class ProjectorAwareTrainer(Trainer):
+    """
+    Custom Trainer that assigns a higher learning rate to the projector.
+    """
+    def create_optimizer(self):
+        """
+        Setup the optimizer with differential learning rates.
+        """
+        opt_model = self.model_wrapped if self.model_wrapped is not None else self.model
+
+        if self.optimizer is None:
+            decay_parameters = list(self.args.weight_decay) if self.args.weight_decay else []
+            
+            # Simple parameter splitting
+            # 1. Projector params (High LR)
+            # 2. Other params (Base LR)
+            
+            projector_params = []
+            base_params = []
+            
+            # Multiplier for projector LR
+            PROJECTOR_LR_MULTIPLIER = 10.0
+            
+            for name, param in opt_model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                    
+                if "projector" in name:
+                    projector_params.append(param)
+                else:
+                    base_params.append(param)
+            
+            if not projector_params:
+                print("WARNING: No projector parameters found for high LR training!")
+            else:
+                print(f"Differential LR: Found {len(projector_params)} projector params (LR x{PROJECTOR_LR_MULTIPLIER}) and {len(base_params)} base params.")
+
+            optimizer_grouped_parameters = [
+                {
+                    "params": projector_params,
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.learning_rate * PROJECTOR_LR_MULTIPLIER,
+                },
+                {
+                    "params": base_params,
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.learning_rate,
+                },
+            ]
+
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return self.optimizer
 
 
 class ResolutionCurriculumCallback(TrainerCallback):
@@ -174,16 +230,34 @@ def train():
     # ------------------------------------------------------------------
     print("Initialize Dataset...")
     
-    # Load the raw HF data first
-    # Using streaming to avoid massive RAM usage
-    raw_dataset = load_dataset("HuggingFaceM4/FineVision", "cocoqa", split="train", streaming=True)
+    # Load multiple subsets for diversity
+    # We select a mix of general VQA, OCR, and Document tasks
+    configs = ["cocoqa", "textvqa", "docvqa", "chartqa", "scienceqa"]
+    print(f"Loading datasets: {configs}")
+    
+    from datasets import concatenate_datasets
+    datasets_list = []
+    for config_name in configs:
+        try:
+            ds = load_dataset("HuggingFaceM4/FineVision", config_name, split="train", streaming=False)
+            datasets_list.append(ds)
+            print(f"Loaded {config_name}: {len(ds)} samples")
+        except Exception as e:
+            print(f"Failed to load {config_name}: {e}")
+            
+    if not datasets_list:
+        raise ValueError("Failed to load any datasets!")
+        
+    raw_dataset = concatenate_datasets(datasets_list)
+    print(f"Total training samples: {len(raw_dataset)}")
     
     # Create image processor with resolution curriculum
     initial_max_res = None if args.no_curriculum else args.low_res
     image_processor = ImageProcessor(max_resolution=initial_max_res)
     
-    # Create dataset with new VQAIterableDataset
-    train_dataset = VQAIterableDataset(
+    # Create dataset with VQADataset (Map-style since streaming=False)
+    from src.data import VQADataset
+    train_dataset = VQADataset(
         dataset=raw_dataset, 
         tokenizer=tokenizer,
         image_processor=image_processor,
@@ -228,12 +302,12 @@ def train():
     if use_lora:
         callbacks.append(ProjectorSaveCallback(model, args.output_dir))
     
-    trainer = Trainer(
+    trainer = ProjectorAwareTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collate_fn,
-        callbacks=callbacks
+        callbacks=callbacks,
     )
     
     print("Starting training...")
