@@ -38,6 +38,15 @@ def load_model(checkpoint_path=None, lora_path=None):
     
     model = NanoQwenVL(config)
     
+    # Load tokenizer and resize embeddings to match checkpoint (with <|image_pad|> token added)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if "<|image_pad|>" not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
+    model.llm.resize_token_embeddings(len(tokenizer))
+    
     if checkpoint_path:
         # Load full checkpoint (all weights)
         print(f"Loading full checkpoint from {checkpoint_path}...")
