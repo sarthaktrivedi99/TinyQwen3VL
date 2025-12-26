@@ -24,6 +24,28 @@ class ResolutionCurriculumCallback(TrainerCallback):
             self.image_processor.set_max_resolution(None)  # Native resolution
             self.switched = True
 
+
+class ProjectorSaveCallback(TrainerCallback):
+    """Callback to save projector weights at every checkpoint (since LoRA doesn't save it)."""
+    
+    def __init__(self, model, output_dir):
+        self.model = model
+        self.output_dir = output_dir
+    
+    def on_save(self, args, state, control, **kwargs):
+        # Save projector to the checkpoint directory
+        checkpoint_dir = f"{self.output_dir}/checkpoint-{state.global_step}"
+        projector_path = f"{checkpoint_dir}/projector.pt"
+        
+        # Access projector through PEFT wrapper
+        try:
+            projector = self.model.base_model.model.projector
+        except AttributeError:
+            projector = self.model.projector
+        
+        torch.save(projector.state_dict(), projector_path)
+        print(f"[ProjectorSaveCallback] Saved projector to {projector_path}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NanoQwenVL model")
     
@@ -193,11 +215,15 @@ def train():
     # ------------------------------------------------------------------
     # 6. Trainer Execution
     # ------------------------------------------------------------------
-    # Resolution curriculum callback
+    # Callbacks
     callbacks = []
     if not args.no_curriculum:
         print(f"Resolution curriculum: low res={args.low_res} -> native at step {args.res_switch_step}")
         callbacks.append(ResolutionCurriculumCallback(image_processor, switch_step=args.res_switch_step))
+    
+    # Add projector save callback when using LoRA (projector not saved by PEFT)
+    if use_lora:
+        callbacks.append(ProjectorSaveCallback(model, args.output_dir))
     
     trainer = Trainer(
         model=model,
