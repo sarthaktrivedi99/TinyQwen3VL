@@ -2,6 +2,8 @@ import os
 import argparse
 import torch
 from transformers import Trainer, TrainingArguments, AutoTokenizer, TrainerCallback
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType
 from src.model import NanoQwenVL, NanoQwenVLConfig
@@ -207,9 +209,7 @@ def train():
         report_to="none",
         gradient_checkpointing=False, # Disabled by user request
         dataloader_pin_memory=True,
-        dataloader_num_workers=4,  # Parallel data loading to prevent blocking
-        dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker
-        dispatch_batches=False,  # Required for IterableDataset with variable sizes
+        dataloader_num_workers=0,  # Use 0 workers for IterableDataset compatibility
         deepspeed=args.deepspeed,  # DeepSpeed config path (None if not used)
     )
     
