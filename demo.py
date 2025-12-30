@@ -1,257 +1,130 @@
-"""
-Gradio demo for NanoQwenVL - Vision Language Model
-"""
-import argparse
+import os
 import gradio as gr
 import torch
 from PIL import Image
-from transformers import AutoTokenizer
-from torchvision import transforms
-import timm
-from timm.data import resolve_model_data_config
-from peft import PeftModel
+from transformers import AutoConfig, AutoModelForCausalLM
+from safetensors.torch import load_file
 
-from src.model import NanoQwenVL, NanoQwenVLConfig
-from src.data import ImageProcessor
+from src.model import TinyQwen3VL, TinyQwen3VLConfig
+from src.processor import TinyQwen3Processor
 
+# --- Register custom model with Auto classes ---
+try:
+    AutoConfig.register("tiny_qwen3_vl", TinyQwen3VLConfig)
+    AutoModelForCausalLM.register(TinyQwen3VLConfig, TinyQwen3VL)
+except ValueError:
+    pass  # Already registered
 
-def _load_checkpoint(filepath):
-    """Load checkpoint from either safetensors or pytorch format."""
-    if filepath.endswith(".safetensors"):
-        from safetensors.torch import load_file
-        return load_file(filepath)
-    else:
-        return torch.load(filepath, map_location="cpu")
+# --- Configuration ---
+CHECKPOINT_PATH = "./checkpoints/final/"
+LLM_MODEL_ID = "Qwen/Qwen3-0.6B"
+VISION_MODEL_ID = "timm/naflexvit_base_patch16_siglip.v2_webli"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+print(f"Loading from {CHECKPOINT_PATH} on {DEVICE}...")
 
-def load_model(checkpoint_path=None, lora_path=None):
-    """Load the model (optionally with full checkpoint or LoRA adapter)."""
-    import os
-    
-    print("Loading base model...")
-    
-    config = NanoQwenVLConfig(
-        llm_model_id="google/gemma-3-270m-it",
-        vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
-        freeze_vision=True,
-        freeze_llm=True
-    )
-    
-    model = NanoQwenVL(config)
-    
-    # Load tokenizer and resize embeddings to match checkpoint (with <|image_pad|> token added)
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if "<|image_pad|>" not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({"additional_special_tokens": ["<|image_pad|>"]})
-    model.llm.resize_token_embeddings(len(tokenizer))
-    
-    if checkpoint_path:
-        # Load full checkpoint (all weights)
-        print(f"Loading full checkpoint from {checkpoint_path}...")
-        if os.path.isdir(checkpoint_path):
-            # Directory with pytorch_model.bin or model.safetensors
-            import glob
-            ckpt_file = None
-            for pattern in ["model.safetensors", "pytorch_model.bin", "*.pt", "*.pth"]:
-                matches = glob.glob(os.path.join(checkpoint_path, pattern))
-                if matches:
-                    ckpt_file = matches[0]
-                    break
-            if ckpt_file:
-                state_dict = _load_checkpoint(ckpt_file)
-                model.load_state_dict(state_dict, strict=False)
-                print(f"Loaded checkpoint from {ckpt_file}")
-            else:
-                print(f"Warning: No checkpoint file found in {checkpoint_path}")
-        else:
-            # Single file
-            state_dict = _load_checkpoint(checkpoint_path)
-            model.load_state_dict(state_dict, strict=False)
-            print(f"Loaded checkpoint from {checkpoint_path}")
-    
-    elif lora_path:
-        # Load LoRA adapter
-        print(f"Loading LoRA adapter from {lora_path}...")
-        model = PeftModel.from_pretrained(model, lora_path)
-        model = model.merge_and_unload()  # Merge for faster inference
-        print("LoRA adapter loaded and merged.")
-        
-        # Also load projector weights (saved separately)
-        projector_path = os.path.join(lora_path, "projector.pt")
-        if os.path.exists(projector_path):
-            print(f"Loading projector from {projector_path}...")
-            projector_state = torch.load(projector_path, map_location="cpu")
-            model.projector.load_state_dict(projector_state)
-            print("Projector loaded successfully.")
-        else:
-            print(f"Warning: No projector.pt found at {projector_path}. Projector is still randomly initialized!")
-    
-    model.eval()
-    
-    # Move to GPU if available
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    model = model.to(device)
-    print(f"Model loaded on {device}")
-    
-    return model, device
+# --- Load Processor ---
+processor = TinyQwen3Processor(
+    llm_model_id=LLM_MODEL_ID,
+    vision_model_id=VISION_MODEL_ID,
+)
+
+# --- Load Model ---
+config = TinyQwen3VLConfig.from_pretrained(CHECKPOINT_PATH, local_files_only=True)
+model = TinyQwen3VL(config)
+
+# Resize embeddings to match tokenizer (includes vision tokens)
+model.llm.resize_token_embeddings(len(processor.tokenizer))
+
+# Load weights
+safetensors_path = os.path.join(CHECKPOINT_PATH, "model.safetensors")
+bin_path = os.path.join(CHECKPOINT_PATH, "pytorch_model.bin")
+
+if os.path.exists(safetensors_path):
+    state_dict = load_file(safetensors_path)
+elif os.path.exists(bin_path):
+    state_dict = torch.load(bin_path, map_location="cpu")
+else:
+    raise FileNotFoundError(f"No model weights found in {CHECKPOINT_PATH}")
+
+model.load_state_dict(state_dict, strict=False)
+model.to(DEVICE)
+model.eval()
+print("Model loaded successfully!")
 
 
-# Global variables (initialized in main)
-MODEL = None
-DEVICE = None  
-TOKENIZER = None
-IMAGE_PROCESSOR = None
-
-
-
-
-
-def generate_response(image, text, max_new_tokens=256, temperature=0.7, top_p=0.9):
-    """Generate a response given an image and text prompt."""
+def inference(image, text, max_new_tokens, temperature):
     if image is None:
         return "Please upload an image."
-    if not text.strip():
-        return "Please enter a text prompt."
-    
-    try:
-        # Convert to PIL if needed
-        if not isinstance(image, Image.Image):
-            image = Image.fromarray(image)
-        image = image.convert('RGB')
-        
-        # Process image using src/data.py logic
-        # ImageProcessor returns (tensor, (grid_h, grid_w))
-        processed_image, _ = IMAGE_PROCESSOR(image)
-        pixel_values = processed_image.unsqueeze(0).to(DEVICE)
-        
-        # Import image token constants
-        from src.data import IMAGE_TOKEN, NUM_IMAGE_TOKENS
-        
-        # Inject image tokens into the user message (256 tokens per image)
-        image_tokens = IMAGE_TOKEN * NUM_IMAGE_TOKENS
-        messages = [
-            {"role": "user", "content": image_tokens + text}
-        ]
-        
-        # Apply chat template
-        prompt = TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        
-        inputs = TOKENIZER(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(DEVICE)
-        attention_mask = inputs["attention_mask"].to(DEVICE)
-        
-        # Get image token ID
-        image_token_id = TOKENIZER.convert_tokens_to_ids(IMAGE_TOKEN)
-        
-        # Generate
-        with torch.no_grad():
-            outputs = MODEL.generate(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                attention_mask=attention_mask,
-                image_token_id=image_token_id,  # Pass to model for token replacement
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=True,
-                pad_token_id=TOKENIZER.pad_token_id or TOKENIZER.eos_token_id,
-                eos_token_id=TOKENIZER.eos_token_id, 
-            )
-        
-        # Decode response
-        response = TOKENIZER.decode(outputs[0], skip_special_tokens=True)
-        
-        # Remove the input text from response if present
-        if response.startswith(text):
-            response = response[len(text):].strip()
-        
-        return response
-    
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return f"Error: {str(e)}"
+    if not text:
+        text = "Describe this image."
+
+    print(f"\n--- Inference: {text} ---")
+
+    messages = [
+        {"role": "user",
+         "content": [{"type": "image"}, {"type": "text", "text": text}]}
+    ]
+
+    inputs = processor.process(images=image, text=messages, return_tensors="pt")
+
+    print(f"[DEBUG] Input IDs shape: {inputs['input_ids'].shape}")
+    print(f"[DEBUG] Pixel values shape: {inputs['pixel_values'].shape}")
+    print(f"[DEBUG] Visual tokens (post 2x2 merge): {inputs.get('num_visual_tokens', 'N/A')}")
+
+    pixel_values = inputs["pixel_values"].to(DEVICE)
+    input_ids = inputs["input_ids"].to(DEVICE)
+    attention_mask = inputs["attention_mask"].to(DEVICE)
+
+    generated_ids = model.generate(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        attention_mask=attention_mask,
+        image_token_id=inputs["image_token_id"],
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=2,
+        do_sample=True,
+        temperature=temperature,
+        top_p=0.9,
+        repetition_penalty=1.1,
+        pad_token_id=processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id,
+        eos_token_id=processor.tokenizer.eos_token_id,
+    )
+
+    input_len = input_ids.shape[1]
+    new_tokens = (generated_ids[0][input_len:]
+                  if generated_ids.shape[1] > input_len
+                  else generated_ids[0])
+
+    generated_text = processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
+    print(f"[DEBUG] Output: '{generated_text}'")
+    return generated_text
 
 
-def create_demo():
-    """Create the Gradio interface."""
-    with gr.Blocks(title="NanoQwenVL Demo", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-        # 🔮 NanoQwenVL Demo
-        A compact Vision-Language Model combining PE-Core vision encoder with Qwen3 LLM.
-        
-        Upload an image and enter a prompt to get a response!
-        """)
-        
-        with gr.Row():
-            with gr.Column(scale=1):
-                image_input = gr.Image(label="Upload Image", type="pil")
-                text_input = gr.Textbox(
-                    label="Text Prompt", 
-                    placeholder="Describe this image...",
-                    lines=3
-                )
-                
-                with gr.Row():
-                    max_tokens = gr.Slider(
-                        minimum=32, maximum=512, value=256, step=32,
-                        label="Max New Tokens"
-                    )
-                    temperature = gr.Slider(
-                        minimum=0.1, maximum=1.5, value=0.7, step=0.1,
-                        label="Temperature"
-                    )
-                
-                submit_btn = gr.Button("🚀 Generate", variant="primary")
-            
-            with gr.Column(scale=1):
-                output = gr.Textbox(label="Model Response", lines=12)
-        
-        # Example prompts
-        gr.Examples(
-            examples=[
-                ["What do you see in this image?"],
-                ["Describe the main objects in this image."],
-                ["What is happening in this scene?"],
-                ["Read any text visible in this image."],
-            ],
-            inputs=[text_input],
-        )
-        
-        # Connect the button
-        submit_btn.click(
-            fn=generate_response,
-            inputs=[image_input, text_input, max_tokens, temperature],
-            outputs=output
-        )
-    
-    return demo
+# --- Gradio UI ---
+with gr.Blocks(title="TinyQwen3VL Demo") as demo:
+    gr.Markdown("# 🔮 TinyQwen3VL Demo")
+    gr.Markdown(f"Loaded from: `{CHECKPOINT_PATH}`")
 
+    with gr.Row():
+        with gr.Column():
+            img_input = gr.Image(type="pil", label="Upload Image")
+            txt_input = gr.Textbox(
+                label="Question", placeholder="Describe this image.",
+                value="Describe this image.")
+
+            with gr.Accordion("Generation Settings", open=True):
+                max_tokens = gr.Slider(10, 512, value=128, label="Max New Tokens")
+                temp = gr.Slider(0.1, 1.5, value=0.7, label="Temperature")
+
+            btn = gr.Button("Generate", variant="primary")
+
+        with gr.Column():
+            output = gr.Textbox(label="Model Output", lines=5)
+
+    btn.click(inference,
+              inputs=[img_input, txt_input, max_tokens, temp],
+              outputs=output)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NanoQwenVL Gradio Demo")
-    parser.add_argument("--checkpoint_path", type=str, default=None, 
-                        help="Path to full model checkpoint (directory or file)")
-    parser.add_argument("--lora_path", type=str, default=None, 
-                        help="Path to LoRA checkpoint directory")
-    parser.add_argument("--share", action="store_true", 
-                        help="Create a public Gradio link")
-    parser.add_argument("--port", type=int, default=7860,
-                        help="Port to run the demo on")
-    args = parser.parse_args()
-    
-    # Initialize model and tokenizer
-    print("=" * 60)
-    print("Initializing NanoQwenVL Demo...")
-    print("=" * 60)
-    
-    MODEL, DEVICE = load_model(checkpoint_path=args.checkpoint_path, lora_path=args.lora_path)
-    TOKENIZER = AutoTokenizer.from_pretrained("google/gemma-3-270m-it", trust_remote_code=True)
-    IMAGE_PROCESSOR = ImageProcessor()  # Use same processor as training
-
-    # Create and launch demo
-    demo = create_demo()
-    demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
+    demo.launch(share=True)

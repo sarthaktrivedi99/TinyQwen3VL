@@ -1,328 +1,155 @@
 import os
 import argparse
 import torch
-from transformers import Trainer, TrainingArguments, AutoTokenizer, TrainerCallback
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
-from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, TaskType
-from src.model import NanoQwenVL, NanoQwenVLConfig
-from src.data import VQADataset, ImageProcessor, collate_fn
+from torch.utils.data import ConcatDataset
+from transformers import Trainer, TrainingArguments
 
+from src.model import TinyQwen3VL, TinyQwen3VLConfig
+from src.processor import TinyQwen3Processor
+from src.data import (
+    collate_fn,
+    load_train_dataset,
+    DATASET_REGISTRY,
+)
 
-class ProjectorAwareTrainer(Trainer):
-    """
-    Custom Trainer that assigns a higher learning rate to the projector.
-    """
-    def create_optimizer(self):
-        """
-        Setup the optimizer with differential learning rates.
-        """
-        opt_model = self.model_wrapped if self.model_wrapped is not None else self.model
-
-        if self.optimizer is None:
-            decay_parameters = list(self.args.weight_decay) if self.args.weight_decay else []
-            
-            # Simple parameter splitting
-            # 1. Projector params (High LR)
-            # 2. Other params (Base LR)
-            
-            projector_params = []
-            base_params = []
-            
-            # Multiplier for projector LR
-            PROJECTOR_LR_MULTIPLIER = 10.0
-            
-            for name, param in opt_model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                    
-                if "projector" in name:
-                    projector_params.append(param)
-                else:
-                    base_params.append(param)
-            
-            if not projector_params:
-                print("WARNING: No projector parameters found for high LR training!")
-            else:
-                print(f"Differential LR: Found {len(projector_params)} projector params (LR x{PROJECTOR_LR_MULTIPLIER}) and {len(base_params)} base params.")
-
-            optimizer_grouped_parameters = [
-                {
-                    "params": projector_params,
-                    "weight_decay": self.args.weight_decay,
-                    "lr": self.args.learning_rate * PROJECTOR_LR_MULTIPLIER,
-                },
-                {
-                    "params": base_params,
-                    "weight_decay": self.args.weight_decay,
-                    "lr": self.args.learning_rate,
-                },
-            ]
-
-            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
-            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-
-        return self.optimizer
-
-
-class ResolutionCurriculumCallback(TrainerCallback):
-    """Callback to switch from low resolution to native resolution during training."""
-    
-    def __init__(self, image_processor, switch_step=2000):
-        self.image_processor = image_processor
-        self.switch_step = switch_step
-        self.switched = False
-    
-    def on_step_begin(self, args, state, control, **kwargs):
-        if not self.switched and state.global_step >= self.switch_step:
-            print(f"\n{'='*60}")
-            print(f"[Resolution Curriculum] Step {state.global_step}: Switching to native resolution")
-            print(f"{'='*60}\n")
-            self.image_processor.set_max_resolution(None)  # Native resolution
-            self.switched = True
-
-
-class ProjectorSaveCallback(TrainerCallback):
-    """Callback to save projector weights at every checkpoint (since LoRA doesn't save it)."""
-    
-    def __init__(self, model, output_dir):
-        self.model = model
-        self.output_dir = output_dir
-    
-    def on_save(self, args, state, control, **kwargs):
-        # Save projector to the checkpoint directory
-        checkpoint_dir = f"{self.output_dir}/checkpoint-{state.global_step}"
-        projector_path = f"{checkpoint_dir}/projector.pt"
-        
-        # Access projector through PEFT wrapper
-        try:
-            projector = self.model.base_model.model.projector
-        except AttributeError:
-            projector = self.model.projector
-        
-        torch.save(projector.state_dict(), projector_path)
-        print(f"[ProjectorSaveCallback] Saved projector to {projector_path}")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train NanoQwenVL model")
-    
-    # LoRA arguments
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank (default: 16)")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha (default: 32)")
-    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout (default: 0.1)")
-    parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for training (default: True)")
-    parser.add_argument("--no_lora", action="store_true", help="Disable LoRA (full fine-tuning)")
-    parser.add_argument("--lora_vision", action="store_true", help="Enable LoRA for vision backbone (default: False)")
-    
-    # DeepSpeed arguments
-    parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config JSON file")
-    
-    # Precision arguments
-    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 precision (recommended for A100/H100)")
-    parser.add_argument("--fp16", action="store_true", default=True, help="Use float16 precision (default: True)")
-    parser.add_argument("--no_fp16", action="store_true", help="Disable fp16, use fp32")
-    parser.add_argument("--flash_attention", action="store_true", help="Use Flash Attention 2 (requires flash-attn package)")
-    
-    # Training arguments
-    parser.add_argument("--output_dir", type=str, default="./nano_qwen_vl_checkpoints", help="Output directory")
-    parser.add_argument("--batch_size", type=int, default=2, help="Per-device batch size (default: 2)")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=64, help="Gradient accumulation steps (default: 64)")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
-    parser.add_argument("--max_steps", type=int, default=10000, help="Max training steps (default: 10000)")
-    parser.add_argument("--save_steps", type=int, default=50, help="Save checkpoint every N steps (default: 50)")
-    parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps (default: 10)")
-    
-    # Resolution curriculum arguments
-    parser.add_argument("--low_res", type=int, default=448, help="Low resolution for curriculum (default: 448)")
-    parser.add_argument("--res_switch_step", type=int, default=2000, help="Step to switch to native resolution (default: 2000)")
-    parser.add_argument("--no_curriculum", action="store_true", help="Disable resolution curriculum")
-    
+    available = ", ".join(sorted(DATASET_REGISTRY.keys()))
+    parser = argparse.ArgumentParser(
+        description="Train TinyQwen3VL",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    # Model
+    parser.add_argument("--vision_model", type=str,
+                        default="timm/naflexvit_base_patch16_siglip.v2_webli")
+    parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-0.6B")
+
+    # Training
+    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+
+    # DeepStack
+    parser.add_argument("--num_deep_layers", type=int, default=4,
+                        help="Number of intermediate ViT layers for DeepStack")
+
+    # Data
+    parser.add_argument(
+        "--datasets", type=str, nargs="+", default=["textvqa"],
+        help=f"Dataset(s) to train on. Can combine multiple.\nAvailable: {available}")
+    parser.add_argument(
+        "--finevision_subset", type=str, default="chartqa",
+        help="Subset name when using 'finevision' dataset")
+    parser.add_argument(
+        "--max_samples", type=int, default=None,
+        help="Limit each dataset to N samples (useful for debugging)")
+
     return parser.parse_args()
 
-def train():
-    args = parse_args()
-    
-    # Handle conflicting args
-    use_lora = args.use_lora and not args.no_lora
-    use_bf16 = args.bf16
-    use_fp16 = args.fp16 and not args.no_fp16 and not args.bf16  # bf16 takes precedence
-    
-    # ------------------------------------------------------------------
-    # 1. Tokenizer Setup (Must be done first to resize model)
-    # ------------------------------------------------------------------
-    llm_model_id = "google/gemma-3-270m-it"
-    print(f"Loading tokenizer: {llm_model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(llm_model_id, trust_remote_code=True)
-    
-    # Fix padding token if missing
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    # CRITICAL: Add the Gemma 3 image token
-    from src.data import IMAGE_TOKEN
-    if IMAGE_TOKEN not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
 
-    # ------------------------------------------------------------------
-    # 2. Model Initialization
-    # ------------------------------------------------------------------
-    print("Initialize Model...")
-    config = NanoQwenVLConfig(
-        llm_model_id=llm_model_id,
-        vision_model_id="naflexvit_base_patch16_siglip.v2_webli",
-        freeze_vision=True, 
-        freeze_llm=False,
-        use_flash_attention=args.flash_attention
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # --- A. Processor ---
+    print(f"[1/5] Loading Processor for {args.llm_model}...")
+    processor = TinyQwen3Processor(
+        vision_model_id=args.vision_model,
+        llm_model_id=args.llm_model,
+        max_patches=576
     )
-    
-    model = NanoQwenVL(config)
-    
-    # CRITICAL: Resize embeddings to fit the new <|image_pad|> token
-    # We assume 'model.llm' is the attribute holding the QwenForCausalLM
-    model.llm.resize_token_embeddings(len(tokenizer))
-    
-    # ------------------------------------------------------------------
-    # 3. Apply LoRA (And save Projector)
-    # ------------------------------------------------------------------
-    if use_lora:
-        print(f"Applying LoRA (r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout})...")
-        
-        # LLM target modules (Gemma architecture)
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        
-        # Add vision backbone modules if enabled (using regex to target vision_tower specifically)
-        if args.lora_vision:
-            print("  -> Including vision backbone in LoRA training")
-            # Use regex patterns to specifically target vision_tower modules
-            # This avoids conflicts with LLM modules that have similar names
-            target_modules.extend([
-                r"vision_tower\.blocks\.\d+\.attn\.qkv",     # Attention QKV
-                r"vision_tower\.blocks\.\d+\.attn\.proj",    # Attention output projection
-                r"vision_tower\.blocks\.\d+\.mlp\.fc1",      # MLP first layer
-                r"vision_tower\.blocks\.\d+\.mlp\.fc2",      # MLP second layer
-            ])
-        
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM, 
-            inference_mode=False, 
-            r=args.lora_r, 
-            lora_alpha=args.lora_alpha, 
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            # NOTE: modules_to_save removed due to DeepSpeed ZeRO compatibility issues
-        )
-        
-        # This wraps the model. Base LLM weights -> Frozen. LoRA adapters -> Trainable.
-        model = get_peft_model(model, peft_config)
-        
-        # Manually ensure projector is trainable (DeepSpeed compatible approach)
-        # The projector is new/random and MUST be trained
-        for param in model.base_model.model.projector.parameters():
-            param.requires_grad = True
-        
-        model.print_trainable_parameters()
-    else:
-        print("Training without LoRA (full fine-tuning)...")
-    
-    # ------------------------------------------------------------------
-    # 4. Dataset Setup
-    # ------------------------------------------------------------------
-    print("Initialize Dataset...")
-    
-    # Load multiple subsets for diversity
-    # We select a mix of general VQA, OCR, and Document tasks
-    configs = ["cocoqa", "textvqa", "docvqa", "chartqa", "scienceqa"]
-    print(f"Loading datasets: {configs}")
-    
-    from datasets import concatenate_datasets
-    datasets_list = []
-    for config_name in configs:
+
+    # --- B. Data ---
+    print(f"[2/5] Loading Datasets: {args.datasets}...")
+    loaded = []
+    for name in args.datasets:
         try:
-            ds = load_dataset("HuggingFaceM4/FineVision", config_name, split="train", streaming=False)
-            datasets_list.append(ds)
-            print(f"Loaded {config_name}: {len(ds)} samples")
+            ds = load_train_dataset(
+                name, processor,
+                subset=args.finevision_subset if name == "finevision" else None,
+                max_samples=args.max_samples,
+            )
+            loaded.append(ds)
+            print(f"      ✓ {name}: {len(ds)} samples")
         except Exception as e:
-            print(f"Failed to load {config_name}: {e}")
-            
-    if not datasets_list:
-        raise ValueError("Failed to load any datasets!")
-        
-    raw_dataset = concatenate_datasets(datasets_list)
-    print(f"Total training samples: {len(raw_dataset)}")
-    
-    # Create image processor with resolution curriculum
-    initial_max_res = None if args.no_curriculum else args.low_res
-    image_processor = ImageProcessor(max_resolution=initial_max_res)
-    
-    # Create dataset with VQADataset (Map-style since streaming=False)
-    from src.data import VQADataset
-    train_dataset = VQADataset(
-        dataset=raw_dataset, 
-        tokenizer=tokenizer,
-        image_processor=image_processor,
+            print(f"      ✗ Skipping {name}: {e}")
+
+    if not loaded:
+        raise ValueError("No datasets loaded!")
+
+    train_dataset = ConcatDataset(loaded) if len(loaded) > 1 else loaded[0]
+    print(f"      Total training samples: {len(train_dataset)}")
+
+    # --- C. Model ---
+    print("[3/5] Initialising Model...")
+    config = TinyQwen3VLConfig(
+        llm_model_id=args.llm_model,
+        vision_model_id=args.vision_model,
+        freeze_vision=True,
+        freeze_llm=False,
+        vision_hidden_size=768,
+        num_deep_layers=args.num_deep_layers,
+        image_token_id=processor.image_token_id,
     )
-    
-    # ------------------------------------------------------------------
-    # 5. Training Arguments
-    # ------------------------------------------------------------------
-    print(f"Training config: bf16={use_bf16}, fp16={use_fp16}, deepspeed={args.deepspeed}")
-    
+
+    model = TinyQwen3VL(config)
+
+    # Resize embeddings for added special tokens
+    tok_len = len(processor.tokenizer)
+    vocab_size = model.llm.get_input_embeddings().weight.shape[0]
+    if tok_len > vocab_size:
+        print(f"      - Resizing embeddings: {vocab_size} -> {tok_len}")
+        model.llm.resize_token_embeddings(tok_len)
+
+    # --- D. Training Arguments ---
+    print("[4/5] Setting up Trainer...")
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size, 
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        max_steps=args.max_steps, 
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        max_steps=args.max_steps,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        bf16=use_bf16,
-        fp16=use_fp16,
-        push_to_hub=False,
-        remove_unused_columns=False, # Essential for custom VLM datasets
-        report_to="none",
-        gradient_checkpointing=False, # Disabled by user request
+        save_total_limit=3,
+        bf16=torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
+        fp16=(not torch.cuda.is_bf16_supported() and torch.cuda.is_available())
+             if torch.cuda.is_available() else False,
+        gradient_checkpointing=True,
+        dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        dataloader_num_workers=4,  # Parallel data loading
-        dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker
-        accelerator_config={"dispatch_batches": False},  # Required for IterableDataset
-        deepspeed=args.deepspeed,  # DeepSpeed config path (None if not used)
+        remove_unused_columns=False,
+        report_to="none",
     )
-    
-    # ------------------------------------------------------------------
-    # 6. Trainer Execution
-    # ------------------------------------------------------------------
-    # Callbacks
-    callbacks = []
-    if not args.no_curriculum:
-        print(f"Resolution curriculum: low res={args.low_res} -> native at step {args.res_switch_step}")
-        callbacks.append(ResolutionCurriculumCallback(image_processor, switch_step=args.res_switch_step))
-    
-    # Add projector save callback when using LoRA (projector not saved by PEFT)
-    if use_lora:
-        callbacks.append(ProjectorSaveCallback(model, args.output_dir))
-    
-    trainer = ProjectorAwareTrainer(
+
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collate_fn,
-        callbacks=callbacks,
+        tokenizer=processor.tokenizer,
     )
-    
-    print("Starting training...")
+
+    # --- E. Train ---
+    print("[5/5] Starting Training...")
     trainer.train()
-    
-    # 7. Save final model
-    trainer.save_model(f"{args.output_dir}/final")
-    
-    # CRITICAL: Also save projector weights separately (not saved by LoRA)
-    if use_lora:
-        projector_path = f"{args.output_dir}/final/projector.pt"
-        torch.save(model.base_model.model.projector.state_dict(), projector_path)
-        print(f"Projector saved to {projector_path}")
-    
-    print("Training finished and model saved.")
+
+    print("Saving final model...")
+    trainer.save_model(os.path.join(args.output_dir, "final"))
+    processor.tokenizer.save_pretrained(os.path.join(args.output_dir, "final"))
+    print("Done!")
+
 
 if __name__ == "__main__":
-    train()
+    main()
