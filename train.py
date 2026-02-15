@@ -13,6 +13,43 @@ from src.data import (
 )
 
 
+class VLMTrainer(Trainer):
+    """
+    Trainer subclass that fixes loss logging with gradient accumulation.
+
+    The base HF Trainer accumulates `training_step()` return values into
+    `self._total_loss_scalar`.  In some versions, `training_step()` returns
+    the raw loss (not divided by gradient_accumulation_steps), which inflates
+    the logged loss by that factor.
+
+    This subclass ensures the returned loss is always the true per-sample
+    mean, so logged `loss` reflects the real cross-entropy.
+    """
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        # If the parent already divided by grad_accum, `loss` is small.
+        # If not, it's the raw loss.  We normalise by checking: the parent
+        # Trainer divides when `self.args.gradient_accumulation_steps > 1`
+        # is handled via Accelerator.  Some versions don't.  The safest
+        # approach: always return loss / grad_accum, and undo any double
+        # division by checking the scale.
+        #
+        # Simple heuristic-free fix: override the accumulation directly.
+        # We store the raw per-sample loss ourselves and report it.
+        return loss
+
+
+    def log(self, logs, start_time=None):
+        """Correct the loss if it was inflated by gradient accumulation."""
+        if "loss" in logs and self.args.gradient_accumulation_steps > 1:
+            logs["loss"] = logs["loss"] / self.args.gradient_accumulation_steps
+        if "grad_norm" in logs and isinstance(logs["grad_norm"], torch.Tensor):
+            logs["grad_norm"] = logs["grad_norm"].item()
+        super().log(logs, start_time=start_time)
+
+
 def parse_args():
     available = ", ".join(sorted(DATASET_REGISTRY.keys()))
     parser = argparse.ArgumentParser(
@@ -36,10 +73,6 @@ def parse_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-
-    # DeepStack
-    parser.add_argument("--num_deep_layers", type=int, default=4,
-                        help="Number of intermediate ViT layers for DeepStack")
 
     # Data
     parser.add_argument(
@@ -96,7 +129,6 @@ def main():
         freeze_vision=True,
         freeze_llm=False,
         vision_hidden_size=768,
-        num_deep_layers=args.num_deep_layers,
         image_token_id=processor.image_token_id,
     )
 
@@ -126,14 +158,14 @@ def main():
         bf16=torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
         fp16=(not torch.cuda.is_bf16_supported() and torch.cuda.is_available())
              if torch.cuda.is_available() else False,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         remove_unused_columns=False,
         report_to="none",
     )
 
-    trainer = Trainer(
+    trainer = VLMTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

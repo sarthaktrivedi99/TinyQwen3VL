@@ -60,7 +60,8 @@ class TinyQwen3Processor:
             + self.VISION_END
         )
 
-    def process(self, images=None, text=None, return_tensors="pt"):
+    def process(self, images=None, text=None, return_tensors="pt",
+                add_generation_prompt=True):
         result = {}
         vision_token_count = 0  # after 2x2 merge
 
@@ -109,7 +110,8 @@ class TinyQwen3Processor:
                 processed_msgs.append({"role": msg["role"], "content": text_content})
 
             prompt = self.tokenizer.apply_chat_template(
-                processed_msgs, tokenize=False, add_generation_prompt=True
+                processed_msgs, tokenize=False,
+                add_generation_prompt=add_generation_prompt,
             )
 
             text_inputs = self.tokenizer(

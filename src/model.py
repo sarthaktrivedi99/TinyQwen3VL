@@ -4,12 +4,11 @@ import timm
 from transformers import (
     AutoModelForCausalLM,
     PreTrainedModel,
-    PretrainedConfig
+    PretrainedConfig,
 )
 
 
 class TinyQwen3VLConfig(PretrainedConfig):
-    """Configuration for TinyQwen3VL following Qwen3VL design patterns."""
     model_type = "tiny_qwen3_vl"
 
     def __init__(
@@ -19,11 +18,10 @@ class TinyQwen3VLConfig(PretrainedConfig):
         freeze_vision=True,
         freeze_llm=False,
         vision_hidden_size=768,
-        num_deep_layers=4,
         patch_size=16,
         spatial_merge_size=2,
         image_token_id=None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.llm_model_id = llm_model_id
@@ -31,263 +29,163 @@ class TinyQwen3VLConfig(PretrainedConfig):
         self.freeze_vision = freeze_vision
         self.freeze_llm = freeze_llm
         self.vision_hidden_size = vision_hidden_size
-        self.num_deep_layers = num_deep_layers
         self.patch_size = patch_size
         self.spatial_merge_size = spatial_merge_size
         self.image_token_id = image_token_id
 
 
-class SpatialMergeProjector(nn.Module):
+class PatchMerger(nn.Module):
     """
-    Qwen3VL-style 2x2 spatial merge MLP projector.
-    Groups 2x2 adjacent vision patches into 1 token (4x reduction),
-    then projects concatenated features to LLM dimension via a 2-layer MLP.
+    Qwen3VL-style PatchMerger: 2x2 spatial merge + 2-layer MLP.
+
+    Matches the reference implementation exactly:
+      LayerNorm(input_dim) → Linear(merged_dim, merged_dim) → GELU → Linear(merged_dim, output_dim)
+    NO output LayerNorm — the output feeds directly into the LLM.
     """
+
     def __init__(self, vision_dim, llm_dim, merge_size=2):
         super().__init__()
         self.merge_size = merge_size
-        input_dim = vision_dim * (merge_size ** 2)
-        self.norm = nn.LayerNorm(input_dim)
-        self.fc1 = nn.Linear(input_dim, llm_dim)
+        merged_dim = vision_dim * (merge_size ** 2)
+        self.norm = nn.LayerNorm(vision_dim)
+        self.fc1 = nn.Linear(merged_dim, merged_dim)
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(llm_dim, llm_dim)
+        self.fc2 = nn.Linear(merged_dim, llm_dim)
 
     def forward(self, x, grid_h, grid_w):
-        """
-        Args:
-            x: [B, num_patches, vision_dim]
-            grid_h, grid_w: patch grid dims (must be divisible by merge_size)
-        Returns: [B, num_merged_tokens, llm_dim]
-        """
         B, N, D = x.shape
         ms = self.merge_size
 
-        # Reshape to spatial grid -> group 2x2 -> concatenate features
+        # Pre-merge LayerNorm (applied before spatial grouping, matching reference)
+        x = self.norm(x)
+
+        # Spatial 2x2 grouping
         x = x.reshape(B, grid_h, grid_w, D)
         x = x.reshape(B, grid_h // ms, ms, grid_w // ms, ms, D)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
         x = x.reshape(B, (grid_h // ms) * (grid_w // ms), ms * ms * D)
 
-        return self.fc2(self.act(self.fc1(self.norm(x))))
+        # MLP projection (no output norm — matches reference)
+        return self.fc2(self.act(self.fc1(x)))
 
 
 class TinyQwen3VL(PreTrainedModel):
     """
-    Tiny Qwen3VL: SigLIP-2 NaFlexViT encoder + Qwen3 LLM decoder
-    with 2x2 spatial merge projector and DeepStack injection.
+    Tiny Qwen3VL = SigLIP-2 NaFlexViT + PatchMerger projector + Qwen3 LLM.
+
+    Architecture follows the reference Qwen3VL implementation:
+      1. ViT extracts patch features
+      2. PatchMerger does 2×2 spatial merge + MLP projection to LLM dim
+      3. Vision features replace <|image_pad|> in text embeddings
+      4. Combined embeddings go through the LLM (standard HF forward)
+
+    Key: pixel_values are cast to LLM dtype before vision forward,
+    matching the reference which does `pixels.to(input_embeds.dtype)`.
     """
     config_class = TinyQwen3VLConfig
-    supports_gradient_checkpointing = True
 
     def __init__(self, config):
         super().__init__(config)
 
-        # 1. Vision Tower (SigLIP-2 NaFlexViT via timm)
+        # Vision encoder (frozen by default)
         self.vision_tower = timm.create_model(
-            config.vision_model_id,
-            pretrained=True,
-            dynamic_img_size=True,
-            num_classes=0
+            config.vision_model_id, pretrained=True,
+            dynamic_img_size=True, num_classes=0,
         )
 
-        # 2. LLM (Qwen3)
+        # LLM
         self.llm = AutoModelForCausalLM.from_pretrained(config.llm_model_id)
         llm_dim = self.llm.config.hidden_size
 
-        # 3. Main projector (2x2 spatial merge — replaces simple MLP)
-        self.projector = SpatialMergeProjector(
-            vision_dim=config.vision_hidden_size,
-            llm_dim=llm_dim,
-            merge_size=config.spatial_merge_size
+        # PatchMerger projector (matches reference: no output LayerNorm)
+        self.projector = PatchMerger(
+            config.vision_hidden_size, llm_dim, config.spatial_merge_size,
         )
 
-        # 4. DeepStack: separate projectors for intermediate ViT layers
-        self.num_deep_layers = config.num_deep_layers
-        self.deep_projectors = nn.ModuleList([
-            SpatialMergeProjector(
-                vision_dim=config.vision_hidden_size,
-                llm_dim=llm_dim,
-                merge_size=config.spatial_merge_size
-            )
-            for _ in range(config.num_deep_layers)
-        ])
-
-        # CRITICAL: Zero-init the output layer of each deep projector so that
-        # DeepStack starts as a no-op. Without this, random projections corrupt
-        # the LLM hidden states and cause loss >> random chance.
-        for proj in self.deep_projectors:
-            nn.init.zeros_(proj.fc2.weight)
-            nn.init.zeros_(proj.fc2.bias)
-
-        # Freeze as configured
+        # Freeze
         if config.freeze_vision:
-            for p in self.vision_tower.parameters():
-                p.requires_grad = False
+            self.vision_tower.requires_grad_(False)
         if config.freeze_llm:
-            for p in self.llm.parameters():
-                p.requires_grad = False
+            self.llm.requires_grad_(False)
 
-    def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None):
-        """Delegate gradient checkpointing to the inner LLM."""
-        self.llm._set_gradient_checkpointing(enable, gradient_checkpointing_func)
-
-    # ---- Embedding helpers ----
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()
 
     def set_input_embeddings(self, value):
         self.llm.set_input_embeddings(value)
 
-    # ---- Vision feature extraction (multi-layer for DeepStack) ----
-    def _extract_vision_features(self, pixel_values):
-        """
-        Returns:
-            final_feats: [B, N, D] from last ViT layer
-            intermediates: list of [B, N, D] from evenly-spaced ViT layers
-            grid_h, grid_w: patch grid dimensions
-        """
+    def _get_vision_features(self, pixel_values):
+        """Run ViT, return [B, N, D] features + grid dims."""
         B, C, H, W = pixel_values.shape
         ps = self.config.patch_size
-        grid_h, grid_w = H // ps, W // ps
+        return self.vision_tower.forward_features(pixel_values), H // ps, W // ps
 
-        num_blocks = len(self.vision_tower.blocks)
-        # Pick evenly-spaced layers for DeepStack
-        indices = [
-            int(i * num_blocks / (self.num_deep_layers + 1))
-            for i in range(1, self.num_deep_layers + 1)
-        ]
+    def _project_and_flatten(self, feats, gh, gw, patch_mask=None):
+        """Project through PatchMerger, return [total_tokens, llm_dim]."""
+        projected = self.projector(feats, gh, gw)  # [B, n_merged, D]
 
-        captured = {}
-        hooks = []
-        for idx in indices:
-            def _hook(module, inp, out, layer_idx=idx):
-                captured[layer_idx] = out
-            hooks.append(self.vision_tower.blocks[idx].register_forward_hook(_hook))
-
-        final_feats = self.vision_tower.forward_features(pixel_values)
-
-        for h in hooks:
-            h.remove()
-
-        intermediates = [captured[idx] for idx in indices]
-        return final_feats, intermediates, grid_h, grid_w
-
-    # ---- Embedding merge ----
-    def _merge_embeddings(self, input_ids, pixel_values, image_token_id,
-                          patch_attention_mask=None):
-        """
-        Replace image-placeholder tokens with 2x2-compressed vision features.
-        Returns:
-            inputs_embeds, deep_visual_list, image_positions, n_visual
-        """
-        inputs_embeds = self.get_input_embeddings()(input_ids)
-        deep_list = None
-        img_pos = None
-        n_vis = 0
-
-        if pixel_values is not None:
-            final_feats, intermediates, gh, gw = \
-                self._extract_vision_features(pixel_values)
-
-            # Project final features (2x2 merge)
-            image_features = self.projector(final_feats, gh, gw)
-
-            # Project intermediate features for DeepStack
-            deep_list = [
-                self.deep_projectors[i](intermediates[i], gh, gw)
-                for i in range(len(intermediates))
-            ]
-
-            # Handle NaFlex patch mask — downsample for 2x2 merge
+        if patch_mask is not None:
             ms = self.config.spatial_merge_size
-            if patch_attention_mask is not None:
-                valid_lists = []
-                deep_valid = [[] for _ in range(len(deep_list))]
-                for b in range(image_features.shape[0]):
-                    mask2d = patch_attention_mask[b].reshape(gh, gw)
-                    cmask = mask2d.reshape(
-                        gh // ms, ms, gw // ms, ms
-                    ).any(dim=1).any(dim=2).flatten()
-                    valid_lists.append(image_features[b][cmask])
-                    for k in range(len(deep_list)):
-                        deep_valid[k].append(deep_list[k][b][cmask])
-                flat_visual = torch.cat(valid_lists, dim=0)
-                deep_list = [torch.cat(dv, dim=0) for dv in deep_valid]
-            else:
-                flat_visual = image_features.reshape(-1, image_features.shape[-1])
-                deep_list = [d.reshape(-1, d.shape[-1]) for d in deep_list]
+            parts = []
+            for b in range(projected.shape[0]):
+                m2d = patch_mask[b].reshape(gh, gw)
+                cm = m2d.reshape(gh // ms, ms, gw // ms, ms).any(1).any(2).flatten()
+                parts.append(projected[b][cm])
+            return torch.cat(parts, dim=0)
 
-            # Replace placeholder tokens
-            image_mask = (input_ids == image_token_id)
-            if image_mask.sum() > 0:
-                bi, si = torch.nonzero(image_mask, as_tuple=True)
-                n_vis = min(bi.shape[0], flat_visual.shape[0])
-                bi, si = bi[:n_vis], si[:n_vis]
-                img_pos = (bi, si)
-                inputs_embeds[bi, si] = flat_visual[:n_vis].to(inputs_embeds.dtype)
-                deep_list = [d[:n_vis] for d in deep_list]
+        return projected.reshape(-1, projected.shape[-1])
 
-        return inputs_embeds, deep_list, img_pos, n_vis
-
-    # ---- Forward (training) with DeepStack hooks ----
     def forward(self, input_ids, pixel_values=None, attention_mask=None,
                 labels=None, image_token_id=None, patch_attention_mask=None,
                 **kwargs):
         if image_token_id is None:
-            image_token_id = getattr(self.config, 'image_token_id', None) or 151665
+            image_token_id = getattr(self.config, "image_token_id", None) or 151655
 
-        embeds, deep_list, img_pos, n_vis = self._merge_embeddings(
-            input_ids, pixel_values, image_token_id, patch_attention_mask
-        )
+        inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # DeepStack: inject intermediate vision features into early LLM layers
-        hooks = []
-        if deep_list and img_pos and n_vis > 0:
-            inject_idxs = list(range(min(len(deep_list),
-                                         len(self.llm.model.layers))))
-            seq_len = embeds.shape[1]
-            for i, li in enumerate(inject_idxs):
-                feats = deep_list[i]
-                bi, si = img_pos
+        if pixel_values is not None:
+            # Cast pixels to LLM dtype (critical for bf16 — matches reference)
+            pixel_values = pixel_values.to(dtype=inputs_embeds.dtype)
 
-                def _make_hook(b, s, f, expected_len):
-                    def hook_fn(module, inp, out):
-                        hs = out[0]
-                        if hs.shape[1] != expected_len:
-                            return out  # skip during KV-cache steps
-                        hs = hs.clone()
-                        hs[b, s] = hs[b, s] + f.to(hs.dtype)
-                        return (hs,) + out[1:]
-                    return hook_fn
+            feats, gh, gw = self._get_vision_features(pixel_values)
+            flat_vis = self._project_and_flatten(feats, gh, gw, patch_attention_mask)
 
-                hooks.append(
-                    self.llm.model.layers[li].register_forward_hook(
-                        _make_hook(bi, si, feats, seq_len)))
+            mask = input_ids == image_token_id
+            if mask.sum() > 0:
+                bi, si = torch.nonzero(mask, as_tuple=True)
+                n = min(len(bi), flat_vis.shape[0])
+                inputs_embeds = inputs_embeds.clone()
+                inputs_embeds[bi[:n], si[:n]] = flat_vis[:n].to(inputs_embeds.dtype)
 
-        output = self.llm(
-            inputs_embeds=embeds,
+        return self.llm(
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            labels=labels
+            labels=labels,
         )
 
-        for h in hooks:
-            h.remove()
-
-        return output
-
-    # ---- Generate (inference) — no DeepStack for simplicity ----
     @torch.no_grad()
     def generate(self, input_ids, pixel_values=None, attention_mask=None,
                  image_token_id=None, patch_attention_mask=None, **kwargs):
         if image_token_id is None:
-            image_token_id = getattr(self.config, 'image_token_id', None) or 151665
+            image_token_id = getattr(self.config, "image_token_id", None) or 151655
 
-        embeds, _, _, _ = self._merge_embeddings(
-            input_ids, pixel_values, image_token_id, patch_attention_mask
-        )
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(dtype=inputs_embeds.dtype)
+
+            feats, gh, gw = self._get_vision_features(pixel_values)
+            flat_vis = self._project_and_flatten(feats, gh, gw, patch_attention_mask)
+
+            mask = input_ids == image_token_id
+            if mask.sum() > 0:
+                bi, si = torch.nonzero(mask, as_tuple=True)
+                n = min(len(bi), flat_vis.shape[0])
+                inputs_embeds = inputs_embeds.clone()
+                inputs_embeds[bi[:n], si[:n]] = flat_vis[:n].to(inputs_embeds.dtype)
 
         return self.llm.generate(
-            inputs_embeds=embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            **kwargs
+            **kwargs,
         )

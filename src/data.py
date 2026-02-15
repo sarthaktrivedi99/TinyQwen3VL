@@ -131,7 +131,8 @@ class FineVisionDataset(Dataset):
              "content": [{"type": "text", "text": assistant_text}]}
         ]
         full_processed = self.processor.process(
-            images=image, text=full_msgs, return_tensors="pt"
+            images=image, text=full_msgs, return_tensors="pt",
+            add_generation_prompt=False,
         )
 
         input_ids = full_processed["input_ids"].squeeze(0)
@@ -215,7 +216,8 @@ class GenericVQADataset(Dataset):
                  "content": [{"type": "text", "text": answer}]}
             ]
             full_processed = self.processor.process(
-                images=image, text=full_msgs, return_tensors="pt"
+                images=image, text=full_msgs, return_tensors="pt",
+                add_generation_prompt=False,
             )
 
             input_ids = full_processed["input_ids"].squeeze(0)
