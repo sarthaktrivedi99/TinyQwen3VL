@@ -128,6 +128,10 @@ class TinyQwen3Processor:
         result["image_token_id"] = self.image_token_id
         return result
 
+    def __call__(self, *args, **kwargs):
+        """Alias for process() to be compatible with HF utilities like GRPOTrainer."""
+        return self.process(*args, **kwargs)
+
 
 class NaFlexResize:
     """

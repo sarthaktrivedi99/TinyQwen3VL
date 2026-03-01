@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision
+transformers>=4.40.0
+datasets>=2.14.0
+trl>=0.8.0
+timm>=0.9.0
+pillow
+accelerate>=0.21.0
+huggingface_hub
+gradio>=4.0.0
+safetensors

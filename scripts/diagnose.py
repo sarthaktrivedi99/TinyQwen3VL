@@ -1,4 +1,7 @@
 """Deep diagnostic: check labels, bf16 vs fp32, and simulated training step."""
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from src.model import TinyQwen3VL, TinyQwen3VLConfig
 from src.processor import TinyQwen3Processor
